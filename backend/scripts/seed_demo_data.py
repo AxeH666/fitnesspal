@@ -195,10 +195,24 @@ def classify_exercise(name: str) -> tuple[str, str, str, bool]:
     return "conditioning", "bodyweight", "carry", False
 
 
-def make_item(name: str, calories: int, protein: int, carbs: int, fat: int) -> dict[str, Any]:
+def make_item(
+    name: str,
+    calories: int,
+    protein_g: int,
+    carbs_g: int,
+    fat_g: int,
+) -> dict[str, Any]:
     """Return the JSON shape used by the food-log schema."""
 
-    return {"name": name, "qty": 1, "unit": "serving", "calories": calories, "protein_g": protein, "carbs_g": carbs, "fat_g": fat}
+    return {
+        "name": name,
+        "qty": 1,
+        "unit": "serving",
+        "calories": calories,
+        "protein_g": protein_g,
+        "carbs_g": carbs_g,
+        "fat_g": fat_g,
+    }
 
 
 def meal_payload(member: DemoMember, day_offset: int, meal_type: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -320,7 +334,23 @@ def add_history(session: Session, members: dict[str, Member], plans: dict[str, W
             )
             for meal_type in ("breakfast", "lunch", "dinner"):
                 items, totals = meal_payload(profile, day_offset, meal_type)
-                session.add(FoodLog(member_id=member.id, log_date=log_date, meal_type=meal_type, items=items, totals=totals, source="whatsapp"))
+                meal_hour = {"breakfast": 8, "lunch": 13, "dinner": 20}[meal_type]
+                meal_recorded_at = datetime.combine(
+                    log_date,
+                    time(hour=meal_hour),
+                    tzinfo=member_timezone,
+                ).astimezone(timezone.utc)
+                session.add(
+                    FoodLog(
+                        member_id=member.id,
+                        log_date=log_date,
+                        meal_type=meal_type,
+                        items=items,
+                        totals=totals,
+                        recorded_at=meal_recorded_at,
+                        source="whatsapp",
+                    )
+                )
             weekday = log_date.weekday()
             frequency = profile["workouts_per_week"]
             should_train = weekday in ({1: {2}, 3: {0, 2, 4}, 4: {0, 1, 3, 5}}[frequency])

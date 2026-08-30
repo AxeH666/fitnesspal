@@ -19,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app.core.dates import local_date  # noqa: E402
 from app.db.session import SessionLocal  # noqa: E402
 from app.models import (  # noqa: E402
     AuditLog,
@@ -148,6 +149,7 @@ DEMO_MEMBERS: tuple[DemoMember, ...] = (
         "dob": date(1992, 5, 14), "sex": "male", "height": Decimal("174.00"), "goal": "fat_loss",
         "activity": "moderate", "experience": "intermediate", "days": 4, "split": "upper_lower",
         "diet": "Vegetarian; enjoys dal, paneer, and home-cooked North Indian meals.", "tier": "quarterly",
+        "timezone": "Asia/Kolkata",
         "status": "active", "bmr": Decimal("1748.00"), "tdee": Decimal("2710.00"), "calories": 2200,
         "protein": 150, "fat": 65, "carbs": 255, "start_weight": Decimal("92.40"), "daily_delta": Decimal("-0.055"),
         "workouts_per_week": 3,
@@ -157,6 +159,7 @@ DEMO_MEMBERS: tuple[DemoMember, ...] = (
         "dob": date(1996, 9, 2), "sex": "female", "height": Decimal("162.00"), "goal": "muscle_gain",
         "activity": "active", "experience": "intermediate", "days": 5, "split": "push_pull_legs",
         "diet": "Eggetarian; prefers Indian meals and easy high-protein snacks.", "tier": "annual",
+        "timezone": "Asia/Kolkata",
         "status": "active", "bmr": Decimal("1370.00"), "tdee": Decimal("2220.00"), "calories": 2400,
         "protein": 125, "fat": 70, "carbs": 310, "start_weight": Decimal("58.20"), "daily_delta": Decimal("0.018"),
         "workouts_per_week": 4,
@@ -166,6 +169,7 @@ DEMO_MEMBERS: tuple[DemoMember, ...] = (
         "dob": date(1988, 1, 21), "sex": "male", "height": Decimal("179.00"), "goal": "strength",
         "activity": "light", "experience": "advanced", "days": 3, "split": "full_body",
         "diet": "Non-vegetarian; prefers simple Indian food and tracks protein inconsistently.", "tier": "monthly",
+        "timezone": "Asia/Kolkata",
         "status": "past_due", "bmr": Decimal("1810.00"), "tdee": Decimal("2490.00"), "calories": 2550,
         "protein": 165, "fat": 75, "carbs": 305, "start_weight": Decimal("81.00"), "daily_delta": Decimal("0.006"),
         "workouts_per_week": 1,
@@ -234,7 +238,7 @@ def add_members(session: Session, now: datetime) -> dict[str, Member]:
         members[profile["email"]] = member
         session.add_all([
             Subscription(member_id=member.id, tier=profile["tier"], status=profile["status"], started_at=now - timedelta(days=60), expires_at=now + timedelta(days=30), payment_provider="manual", payment_ref=f"DEMO-{member.id.hex[:8]}"),
-            MemberProfile(member_id=member.id, goal=profile["goal"], activity_level=profile["activity"], training_experience=profile["experience"], injuries_limitations=None, preferred_days_per_week=profile["days"], preferred_split=profile["split"], dietary_preferences=profile["diet"], whatsapp_linked=True, whatsapp_phone=profile["phone"], whatsapp_verified_at=now, onboarding_completed_at=now - timedelta(days=60)),
+            MemberProfile(member_id=member.id, goal=profile["goal"], activity_level=profile["activity"], training_experience=profile["experience"], injuries_limitations=None, preferred_days_per_week=profile["days"], preferred_split=profile["split"], dietary_preferences=profile["diet"], timezone=profile["timezone"], whatsapp_linked=True, whatsapp_phone=profile["phone"], whatsapp_verified_at=now, onboarding_completed_at=now - timedelta(days=60)),
             MemberNutritionTarget(member_id=member.id, bmr_kcal=profile["bmr"], tdee_kcal=profile["tdee"], calorie_target_kcal=profile["calories"], protein_target_g=profile["protein"], fat_target_g=profile["fat"], carb_target_g=profile["carbs"], calculated_at=now),
             AuditLog(member_id=member.id, action="seed_member", entity_type="member", entity_id=member.id, after={"email": member.email, "goal": profile["goal"]}, source="system", actor="system"),
         ])
@@ -287,12 +291,12 @@ def add_workout_plans(session: Session, members: dict[str, Member], exercises: d
     return active_by_member
 
 
-def add_history(session: Session, members: dict[str, Member], plans: dict[str, WorkoutPlan], exercises: dict[str, Exercise]) -> None:
+def add_history(session: Session, members: dict[str, Member], plans: dict[str, WorkoutPlan], exercises: dict[str, Exercise], now: datetime) -> None:
     """Create 28 days of bodyweight, food, and workout history for every demo user."""
 
-    today = date.today()
     workout_names = ("Barbell Back Squat", "Barbell Bench Press", "Barbell Row")
     for profile in DEMO_MEMBERS:
+        today = local_date(now, profile["timezone"])
         member = members[profile["email"]]
         plan = plans[str(member.id)]
         for day_offset in range(28):
@@ -340,7 +344,7 @@ def seed_demo_data() -> None:
         members = add_members(session, now)
         exercises = add_exercises(session)
         plans = add_workout_plans(session, members, exercises)
-        add_history(session, members, plans, exercises)
+        add_history(session, members, plans, exercises, now)
         add_trend_flags(session, members, now)
         session.commit()
     print(f"Seeded {len(DEMO_MEMBERS)} demo members, {len(EXERCISE_CATALOG)} exercises, 8 plans, and 28 days of history.")
@@ -348,4 +352,3 @@ def seed_demo_data() -> None:
 
 if __name__ == "__main__":
     seed_demo_data()
-

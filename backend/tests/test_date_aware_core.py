@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 import unittest
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import Engine, Table, create_engine, func, select
@@ -26,11 +26,16 @@ from app.models import (
 )
 from app.services.member_state import (
     DayState,
+    NutritionTotals,
     get_bodyweight_for_day,
     get_day_state,
+    get_food_for_day,
+    get_food_totals_for_day,
     get_latest_bodyweight,
+    get_today_food_totals,
     get_today_state,
     log_bodyweight,
+    log_food,
 )
 
 
@@ -126,8 +131,18 @@ class DateAwareCoreTests(unittest.TestCase):
         food = FoodLog(
             member_id=member_id,
             log_date=day,
-            items=[{"marker": marker}],
-            totals={"calories": 1},
+            items=[{"name": marker, "qty": 1, "unit": "serving"}],
+            totals={
+                "calories": 1,
+                "protein_g": 2,
+                "carbs_g": 3,
+                "fat_g": 4,
+            },
+            recorded_at=datetime.combine(
+                day,
+                time(hour=13),
+                tzinfo=timezone.utc,
+            ),
             note=marker,
         )
         workout = WorkoutLog(
@@ -149,6 +164,46 @@ class DateAwareCoreTests(unittest.TestCase):
         assert count is not None
         return count
 
+    def _food_count(self, member_id: UUID) -> int:
+        count = self.session.scalar(
+            select(func.count())
+            .select_from(FoodLog)
+            .where(FoodLog.member_id == member_id)
+        )
+        assert count is not None
+        return count
+
+    def _food_item(
+        self,
+        name: str,
+        *,
+        qty: int | float = 1,
+        unit: str = "serving",
+        calories: int | float = 0,
+        protein_g: int | float = 0,
+        carbs_g: int | float = 0,
+        fat_g: int | float = 0,
+    ) -> dict[str, Any]:
+        return {
+            "name": name,
+            "qty": qty,
+            "unit": unit,
+            "calories": calories,
+            "protein_g": protein_g,
+            "carbs_g": carbs_g,
+            "fat_g": fat_g,
+        }
+
+    def assert_food_recorded_at_matches(
+        self,
+        food_log: FoodLog,
+        expected: datetime,
+    ) -> None:
+        actual = food_log.recorded_at
+        if actual.tzinfo is None:
+            actual = actual.replace(tzinfo=timezone.utc)
+        self.assertEqual(actual, expected.astimezone(timezone.utc))
+
     def assert_recorded_at_matches(
         self,
         bodyweight_log: BodyweightLog,
@@ -169,6 +224,7 @@ class DateAwareCoreTests(unittest.TestCase):
         assert state.bodyweight_log is not None
         self.assertEqual(state.bodyweight_log.id, weight.id)
         self.assertEqual([log.id for log in state.food_logs], [food.id])
+        self.assertEqual(state.food_totals, NutritionTotals(1, 2, 3, 4))
         self.assertEqual([log.id for log in state.workout_logs], [workout.id])
         self.assertEqual(state.bodyweight_log.log_date, state.local_date)
         self.assertTrue(all(log.log_date == state.local_date for log in state.food_logs))
@@ -279,7 +335,13 @@ class DateAwareCoreTests(unittest.TestCase):
         self.assertEqual(state.local_date, requested_day)
         self.assertIsNone(state.bodyweight_log)
         self.assertEqual(state.food_logs, ())
+        self.assertEqual(state.food_totals, NutritionTotals())
         self.assertEqual(state.workout_logs, ())
+        self.assertEqual(get_food_for_day(self.session, member.id, requested_day), ())
+        self.assertEqual(
+            get_food_totals_for_day(self.session, member.id, requested_day),
+            NutritionTotals(),
+        )
 
     def test_first_weight_log_persists_with_event_time_and_local_date(self) -> None:
         member = self._add_member("first-weight@example.test")
@@ -599,6 +661,326 @@ class DateAwareCoreTests(unittest.TestCase):
         self.assertEqual(today_state.bodyweight_log.weight_kg, Decimal("79.80"))
         self.assertEqual(day_a_state.bodyweight_log.id, day_a_log.id)
         self.assertEqual(day_a_state.bodyweight_log.weight_kg, Decimal("80.00"))
+
+    def test_food_log_preserves_details_totals_timestamp_and_local_date(self) -> None:
+        member = self._add_member("first-food@example.test")
+        event_time = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+        items = [
+            self._food_item(
+                "Eggs",
+                qty=4,
+                unit="eggs",
+                calories=280,
+                protein_g=24.5,
+                carbs_g=2,
+                fat_g=20,
+            ),
+            self._food_item(
+                "Roti",
+                qty=2,
+                unit="pieces",
+                calories=180,
+                protein_g=5.5,
+                carbs_g=36,
+                fat_g=2,
+            ),
+        ]
+        items[0]["model_detail"] = {"cooking_method": "boiled"}
+        expected_items = [dict(item) for item in items]
+        expected_items[0]["model_detail"] = {"cooking_method": "boiled"}
+        totals = NutritionTotals(460, 30, 38, 22)
+
+        logged = log_food(
+            self.session,
+            member.id,
+            items,
+            totals,
+            event_time,
+            meal_type=" breakfast ",
+            note="Model-estimated meal",
+        )
+        logged_id = logged.id
+        items[0]["name"] = "mutated by caller"
+        cast(dict[str, Any], items[0]["model_detail"])["cooking_method"] = "fried"
+        self.assertEqual(logged.items, expected_items)
+        self.session.expunge_all()
+
+        persisted_logs = get_food_for_day(
+            self.session,
+            member.id,
+            date(2026, 8, 31),
+        )
+
+        self.assertEqual(len(persisted_logs), 1)
+        persisted = persisted_logs[0]
+        self.assertEqual(persisted.id, logged_id)
+        self.assertEqual(persisted.member_id, member.id)
+        self.assertEqual(persisted.log_date, date(2026, 8, 31))
+        self.assertEqual(persisted.meal_type, "breakfast")
+        self.assertEqual(persisted.note, "Model-estimated meal")
+        self.assertEqual(persisted.items, expected_items)
+        self.assertEqual(
+            persisted.totals,
+            {"calories": 460, "protein_g": 30, "carbs_g": 38, "fat_g": 22},
+        )
+        self.assert_food_recorded_at_matches(persisted, event_time)
+        self.assertEqual(
+            get_food_totals_for_day(
+                self.session,
+                member.id,
+                date(2026, 8, 31),
+            ),
+            totals,
+        )
+
+    def test_multiple_meals_on_one_local_day_append_and_sum(self) -> None:
+        member = self._add_member("multiple-meals@example.test")
+        first = log_food(
+            self.session,
+            member.id,
+            [self._food_item("Meal A")],
+            NutritionTotals(101, 17, 23, 5),
+            datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc),
+        )
+        second = log_food(
+            self.session,
+            member.id,
+            [self._food_item("Meal B")],
+            NutritionTotals(307, 29, 41, 13),
+            datetime(2026, 8, 31, 17, 0, tzinfo=timezone.utc),
+        )
+
+        food_logs = get_food_for_day(
+            self.session,
+            member.id,
+            date(2026, 8, 31),
+        )
+
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual([food.id for food in food_logs], [first.id, second.id])
+        self.assertEqual(self._food_count(member.id), 2)
+        self.assertEqual(
+            get_food_totals_for_day(
+                self.session,
+                member.id,
+                date(2026, 8, 31),
+            ),
+            NutritionTotals(408, 46, 64, 18),
+        )
+
+    def test_food_local_midnight_keeps_days_and_state_separate(self) -> None:
+        member = self._add_member("food-midnight@example.test")
+        before_midnight = datetime(2026, 8, 30, 18, 29, 59, tzinfo=timezone.utc)
+        at_midnight = datetime(2026, 8, 30, 18, 30, tzinfo=timezone.utc)
+        day_a_log = log_food(
+            self.session,
+            member.id,
+            [self._food_item("Day A")],
+            NutritionTotals(401, 31, 51, 11),
+            before_midnight,
+        )
+        day_b_log = log_food(
+            self.session,
+            member.id,
+            [self._food_item("Day B")],
+            NutritionTotals(509, 43, 67, 17),
+            at_midnight,
+        )
+
+        day_a_state = get_day_state(self.session, member.id, date(2026, 8, 30))
+        day_b_state = get_day_state(self.session, member.id, date(2026, 8, 31))
+        today_state = get_today_state(self.session, member.id, now=at_midnight)
+
+        self.assertEqual([food.id for food in day_a_state.food_logs], [day_a_log.id])
+        self.assertEqual(day_a_state.food_totals, NutritionTotals(401, 31, 51, 11))
+        self.assertEqual([food.id for food in day_b_state.food_logs], [day_b_log.id])
+        self.assertEqual(day_b_state.food_totals, NutritionTotals(509, 43, 67, 17))
+        self.assertEqual([food.id for food in today_state.food_logs], [day_b_log.id])
+        self.assertEqual(today_state.food_totals, NutritionTotals(509, 43, 67, 17))
+        self.assertEqual(
+            get_today_food_totals(self.session, member.id, now=at_midnight),
+            NutritionTotals(509, 43, 67, 17),
+        )
+        self.assertEqual(
+            get_food_totals_for_day(
+                self.session,
+                member.id,
+                date(2026, 8, 30),
+            ),
+            NutritionTotals(401, 31, 51, 11),
+        )
+
+    def test_food_reads_and_totals_are_member_scoped(self) -> None:
+        member_a = self._add_member("food-a@example.test")
+        member_b = self._add_member("food-b@example.test")
+        event_time = datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc)
+        member_a_log = log_food(
+            self.session,
+            member_a.id,
+            [self._food_item("Member A")],
+            NutritionTotals(211, 19, 27, 7),
+            event_time,
+        )
+        member_b_log = log_food(
+            self.session,
+            member_b.id,
+            [self._food_item("Member B")],
+            NutritionTotals(911, 79, 127, 37),
+            event_time,
+        )
+
+        member_a_logs = get_food_for_day(
+            self.session,
+            member_a.id,
+            date(2026, 8, 30),
+        )
+        member_b_logs = get_food_for_day(
+            self.session,
+            member_b.id,
+            date(2026, 8, 30),
+        )
+
+        self.assertEqual([food.id for food in member_a_logs], [member_a_log.id])
+        self.assertEqual([food.id for food in member_b_logs], [member_b_log.id])
+        self.assertEqual(
+            get_today_food_totals(self.session, member_a.id, now=event_time),
+            NutritionTotals(211, 19, 27, 7),
+        )
+        self.assertEqual(
+            get_today_food_totals(self.session, member_b.id, now=event_time),
+            NutritionTotals(911, 79, 127, 37),
+        )
+
+    def test_same_instant_uses_each_members_timezone_for_food(self) -> None:
+        kolkata_member = self._add_member("food-kolkata@example.test", "Asia/Kolkata")
+        new_york_member = self._add_member(
+            "food-new-york@example.test",
+            "America/New_York",
+        )
+        event_time = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+        kolkata_log = log_food(
+            self.session,
+            kolkata_member.id,
+            [self._food_item("Kolkata meal")],
+            NutritionTotals(301, 21, 41, 9),
+            event_time,
+        )
+        new_york_log = log_food(
+            self.session,
+            new_york_member.id,
+            [self._food_item("New York meal")],
+            NutritionTotals(701, 51, 81, 19),
+            event_time,
+        )
+
+        self.assertEqual(kolkata_log.log_date, date(2026, 8, 31))
+        self.assertEqual(new_york_log.log_date, date(2026, 8, 30))
+        self.assertEqual(
+            get_food_for_day(
+                self.session,
+                kolkata_member.id,
+                date(2026, 8, 30),
+            ),
+            (),
+        )
+        self.assertEqual(
+            get_food_for_day(
+                self.session,
+                new_york_member.id,
+                date(2026, 8, 31),
+            ),
+            (),
+        )
+
+    def test_invalid_food_inputs_are_rejected_without_side_effects(self) -> None:
+        member = self._add_member("invalid-food@example.test")
+        event_time = datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc)
+        valid_totals = NutritionTotals(101, 17, 23, 5)
+        invalid_items: list[tuple[str, list[dict[str, Any]]]] = [
+            ("empty items", []),
+            ("missing name", [{"qty": 1, "unit": "serving"}]),
+            ("blank name", [{"name": " ", "qty": 1, "unit": "serving"}]),
+            ("missing unit", [{"name": "Meal", "qty": 1}]),
+            ("blank unit", [{"name": "Meal", "qty": 1, "unit": " "}]),
+            ("missing quantity", [{"name": "Meal", "unit": "serving"}]),
+            ("zero quantity", [self._food_item("Meal", qty=0)]),
+            ("negative quantity", [self._food_item("Meal", qty=-1)]),
+            ("NaN quantity", [self._food_item("Meal", qty=float("nan"))]),
+            ("infinite quantity", [self._food_item("Meal", qty=float("inf"))]),
+            ("boolean quantity", [self._food_item("Meal", qty=cast(int, True))]),
+            ("negative item calories", [self._food_item("Meal", calories=-1)]),
+            (
+                "boolean item protein",
+                [self._food_item("Meal", protein_g=cast(int, True))],
+            ),
+            (
+                "infinite item carbs",
+                [self._food_item("Meal", carbs_g=float("inf"))],
+            ),
+            (
+                "non-JSON item detail",
+                [{**self._food_item("Meal"), "detail": {"not-json"}}],
+            ),
+            (
+                "non-finite item detail",
+                [{**self._food_item("Meal"), "confidence": float("nan")}],
+            ),
+        ]
+        for label, items in invalid_items:
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    log_food(
+                        self.session,
+                        member.id,
+                        items,
+                        valid_totals,
+                        event_time,
+                    )
+                self.assertEqual(len(self.session.new), 0)
+                self.assertEqual(self._food_count(member.id), 0)
+
+        invalid_totals = [
+            NutritionTotals(-1, 0, 0, 0),
+            NutritionTotals(0, cast(int, True), 0, 0),
+            NutritionTotals(0, 0, cast(int, 1.5), 0),
+        ]
+        for totals in invalid_totals:
+            with self.subTest(totals=totals):
+                with self.assertRaises(ValueError):
+                    log_food(
+                        self.session,
+                        member.id,
+                        [self._food_item("Meal")],
+                        totals,
+                        event_time,
+                    )
+                self.assertEqual(len(self.session.new), 0)
+                self.assertEqual(self._food_count(member.id), 0)
+
+        for meal_type in (" ", "x" * 21):
+            with self.subTest(meal_type=meal_type):
+                with self.assertRaises(ValueError):
+                    log_food(
+                        self.session,
+                        member.id,
+                        [self._food_item("Meal")],
+                        valid_totals,
+                        event_time,
+                        meal_type=meal_type,
+                    )
+                self.assertEqual(len(self.session.new), 0)
+                self.assertEqual(self._food_count(member.id), 0)
+
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            log_food(
+                self.session,
+                member.id,
+                [self._food_item("Meal")],
+                valid_totals,
+                datetime(2026, 8, 30, 10, 0),
+            )
+        self.assertEqual(len(self.session.new), 0)
+        self.assertEqual(self._food_count(member.id), 0)
 
 
 if __name__ == "__main__":

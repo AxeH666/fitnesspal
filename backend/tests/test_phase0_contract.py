@@ -6,6 +6,8 @@ import ast
 from pathlib import Path
 import unittest
 
+from scripts.seed_demo_data import DEMO_MEMBERS, meal_payload
+
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = BACKEND_ROOT / "alembic" / "versions" / "20260826_0001_initial_schema.py"
@@ -40,7 +42,20 @@ class PhaseZeroContractTests(unittest.TestCase):
         assert isinstance(catalog, ast.Tuple)
         self.assertGreaterEqual(len(catalog.elts), 100)
 
+    def test_seed_meal_payload_matches_food_json_contract(self) -> None:
+        expected_totals = {"calories", "protein_g", "carbs_g", "fat_g"}
+
+        for member in DEMO_MEMBERS:
+            for meal_type in ("breakfast", "lunch", "dinner"):
+                with self.subTest(member=member["email"], meal_type=meal_type):
+                    items, totals = meal_payload(member, 0, meal_type)
+
+                    self.assertEqual(set(totals), expected_totals)
+                    self.assertEqual(len(items), 1)
+                    self.assertTrue({"name", "qty", "unit"} <= set(items[0]))
+                    for nutrient in expected_totals:
+                        self.assertEqual(items[0][nutrient], totals[nutrient])
+
 
 if __name__ == "__main__":
     unittest.main()
-

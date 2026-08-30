@@ -147,7 +147,7 @@ class BodyweightLog(UUIDPrimaryKeyMixin, Base):
     note: Mapped[str | None] = mapped_column(Text)
 
 
-class FoodLog(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+class FoodLog(UUIDPrimaryKeyMixin, Base):
     """A member meal, including extracted food items and calculated totals."""
 
     __tablename__ = "food_logs"
@@ -160,6 +160,12 @@ class FoodLog(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     meal_type: Mapped[str | None] = mapped_column(String(20))
     items: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     totals: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        "created_at",
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
     source: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'whatsapp'"))
     note: Mapped[str | None] = mapped_column(Text)
 

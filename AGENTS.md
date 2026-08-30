@@ -134,6 +134,39 @@ The LLM must not invent or independently calculate the authoritative protein tar
 
 Per-meal calorie and macro values are the documented exception: for the POC they may be model estimates. Totals derived from stored meals are calculated by backend code.
 
+### Reasoning and Retrieval Policy
+
+Use the LLM as the primary reasoning engine. It handles interpretation, advice, allowed estimation, explanation, and the decision about whether an authoritative tool is needed.
+
+Do not retrieve database state merely because member data exists. Answer directly from general knowledge or the current interaction when exact personal state is not required. This includes:
+
+- open-ended fitness or nutrition advice
+- food-option questions such as "What can I eat from these options?"
+- meal-quality questions such as "Is this a good post-workout meal?"
+- substitutions and meal ideas
+- general fitness questions
+- reasoning over information already supplied in the current interaction or available context
+
+Browsing or searching may be used when current external information is genuinely useful and available agent tooling supports it. This policy does not authorize adding browsing infrastructure or expand the POC scope.
+
+Retrieve authoritative state before answering when the result depends on exact personal facts, chronology, or persistence. This includes:
+
+- today's remaining protein or consumed calories
+- yesterday's meals or training
+- the last performance of an exercise
+- comparisons between bodyweight records
+- a previously stored video-analysis summary
+- any claim about stored member history or exact day-specific facts
+
+Every log, mutation, or target update must use the appropriate backend operation.
+
+The LLM must not invent exact personal history, dates, targets, totals, or stored values. When those facts are required, retrieve them. When they are not required, let the LLM answer directly.
+
+In short:
+
+- LLM = reasoning, interpretation, advice, estimation, explanation, and deciding whether a tool is needed.
+- Backend/PostgreSQL = authoritative personal facts, dates, historical state, persistence, and deterministic calculations already defined by the POC.
+
 ## Video
 
 Use an existing video-capable model for the POC.

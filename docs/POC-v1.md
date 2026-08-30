@@ -291,7 +291,11 @@ The member can ask:
 
 "I have chicken, rice, eggs and curd. What should I eat now?"
 
-Barbarik should use:
+This can be either a general food-options question or a request grounded in the member's exact current state. The LLM decides which case applies.
+
+A general question such as "What can I eat from these options?" or "Is this a good post-workout meal?" can be answered directly from the foods and context in the current interaction. The existence of stored member data does not by itself require retrieval.
+
+For the personalized, state-dependent version of the request, Barbarik retrieves and uses:
 
 - current fitness goal
 - calorie target, if one has been set
@@ -300,11 +304,11 @@ Barbarik should use:
 - remaining intake
 - foods the user says are available
 
-The result should be contextual to that member and that day.
+That result should be contextual to that member and that day. If the response states or depends on exact remaining intake, current targets, or food already logged today, those values must be retrieved rather than inferred.
 
 If no calorie target has been set, Barbarik reasons from the active protein target and today's logged food, and does not report remaining calories.
 
-An active protein target is required for this feature. See section 2.
+An active protein target is required for the personalized, state-dependent version of this feature. See section 2.
 
 ---
 
@@ -477,6 +481,47 @@ The LLM must not be the database.
 Deterministic backend code owns calculated numerical values such as the recommended protein target and the workout-intensity score. The LLM may explain those values. It must not invent them.
 
 Per-meal calorie and macro values are the one exception: for the POC they may be model estimates, as stated in section 5. Once stored they are data, and totals are computed by the backend.
+
+## Reasoning and Retrieval Policy
+
+Barbarik uses the LLM as the primary reasoning engine. The LLM interprets the request, gives advice and explanations, makes allowed estimates, and decides whether an authoritative tool or database read is needed.
+
+The existence of a member record or other stored data does not automatically require database retrieval.
+
+The LLM should normally answer directly, without personal database retrieval, when the request can be handled from general knowledge or information already present in the current interaction. Examples include:
+
+- open-ended fitness or nutrition advice
+- "What can I eat from these options?"
+- "Is this a good post-workout meal?"
+- substitutions and meal ideas
+- general fitness questions
+- reasoning over information already supplied in the current interaction or available context
+
+When current external information is genuinely useful, the LLM may use browsing or search if the available agent tooling supports it. This policy does not add a browsing requirement or browsing infrastructure to the POC.
+
+Backend or PostgreSQL retrieval is required when the answer depends on exact personal state, chronology, or persisted history. Examples include:
+
+- "How much protein do I have left today?"
+- "How many calories have I eaten today?"
+- "What did I eat yesterday?"
+- "What did I train yesterday?"
+- "What did I bench last time?"
+- "Compare today's weight with yesterday."
+- "What did you say about my squat yesterday?"
+- any claim about stored member history or exact day-specific facts
+
+Every log, mutation, or target update must use the appropriate backend operation so the change is validated and persisted.
+
+Decision rule:
+
+- If exact personal state is not required, let the LLM answer directly.
+- If the answer would state, compare, calculate from, or change exact stored personal facts, retrieve or mutate through the backend first.
+- Retrieved state is authoritative. The LLM must not invent exact personal history, dates, targets, totals, or stored values.
+
+In short:
+
+- LLM = reasoning, interpretation, advice, estimation, explanation, and deciding whether a tool is needed.
+- Backend/PostgreSQL = authoritative personal facts, dates, historical state, persistence, and deterministic calculations already defined by the POC.
 
 ---
 

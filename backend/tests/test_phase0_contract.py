@@ -11,6 +11,12 @@ from scripts.seed_demo_data import DEMO_MEMBERS, meal_payload
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = BACKEND_ROOT / "alembic" / "versions" / "20260826_0001_initial_schema.py"
+NUTRITION_TIMESTAMP_REPAIR = (
+    BACKEND_ROOT
+    / "alembic"
+    / "versions"
+    / "20260831_0004_repair_nutrition_target_created_at.py"
+)
 SEED_SCRIPT = BACKEND_ROOT / "scripts" / "seed_demo_data.py"
 
 
@@ -28,6 +34,26 @@ class PhaseZeroContractTests(unittest.TestCase):
             self.assertIn(f'"{table}"', source)
         self.assertIn("CREATE EXTENSION IF NOT EXISTS pgcrypto", source)
         self.assertIn("CREATE EXTENSION IF NOT EXISTS vector", source)
+
+    def test_nutrition_timestamp_repair_preserves_canonical_schema(self) -> None:
+        source = NUTRITION_TIMESTAMP_REPAIR.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        downgrade = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "downgrade"
+        )
+
+        self.assertIn('revision: str = "20260831_0004"', source)
+        self.assertIn('down_revision: str | None = "20260830_0003"', source)
+        self.assertIn("ADD COLUMN IF NOT EXISTS created_at", source)
+        self.assertIn("TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()", source)
+        self.assertEqual(len(downgrade.body), 1)
+        self.assertEqual(
+            ast.get_docstring(downgrade),
+            "Retain the column already owned by canonical revision 20260826_0001.",
+        )
+        self.assertFalse(any(isinstance(node, ast.Call) for node in ast.walk(downgrade)))
 
     def test_seed_catalog_has_about_one_hundred_exercises(self) -> None:
         tree = ast.parse(SEED_SCRIPT.read_text(encoding="utf-8"))

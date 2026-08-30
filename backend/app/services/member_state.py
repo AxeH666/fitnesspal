@@ -13,7 +13,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.core.dates import local_date
-from app.models import BodyweightLog, FoodLog, MemberProfile, WorkoutLog
+from app.models import BodyweightLog, Exercise, FoodLog, MemberProfile, WorkoutLog
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +24,22 @@ class NutritionTotals:
     protein_g: int = 0
     carbs_g: int = 0
     fat_g: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class WorkoutSetInput:
+    """One completed set supplied by a deterministic workout operation."""
+
+    reps: int
+    weight_kg: int | float
+
+
+@dataclass(frozen=True, slots=True)
+class WorkoutExerciseInput:
+    """One canonical exercise and its completed sets."""
+
+    exercise_id: UUID
+    sets: tuple[WorkoutSetInput, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,19 +318,207 @@ def get_today_food_totals(
     return get_food_totals_for_day(session, member_id, day)
 
 
+def _workout_exercises_payload(
+    session: Session,
+    exercises: tuple[WorkoutExerciseInput, ...],
+) -> list[dict[str, Any]]:
+    """Validate workout performance and attach canonical exercise names."""
+
+    if not exercises:
+        raise ValueError("exercises must contain at least one exercise")
+
+    exercise_ids: list[UUID] = []
+    serialized_sets: list[list[dict[str, int | float]]] = []
+    for exercise_index, exercise in enumerate(exercises):
+        if not isinstance(exercise, WorkoutExerciseInput):
+            raise ValueError(
+                f"exercises[{exercise_index}] must be a WorkoutExerciseInput"
+            )
+        if not isinstance(exercise.exercise_id, UUID):
+            raise ValueError(f"exercises[{exercise_index}].exercise_id must be a UUID")
+        if not exercise.sets:
+            raise ValueError(
+                f"exercises[{exercise_index}].sets must contain at least one set"
+            )
+
+        set_payloads: list[dict[str, int | float]] = []
+        for set_index, completed_set in enumerate(exercise.sets):
+            if not isinstance(completed_set, WorkoutSetInput):
+                raise ValueError(
+                    f"exercises[{exercise_index}].sets[{set_index}] "
+                    "must be a WorkoutSetInput"
+                )
+            if (
+                isinstance(completed_set.reps, bool)
+                or not isinstance(completed_set.reps, int)
+                or completed_set.reps <= 0
+            ):
+                raise ValueError(
+                    f"exercises[{exercise_index}].sets[{set_index}].reps "
+                    "must be a positive integer"
+                )
+
+            weight_kg = completed_set.weight_kg
+            if (
+                isinstance(weight_kg, bool)
+                or not isinstance(weight_kg, (int, float))
+                or (isinstance(weight_kg, float) and not math.isfinite(weight_kg))
+                or weight_kg < 0
+            ):
+                raise ValueError(
+                    f"exercises[{exercise_index}].sets[{set_index}].weight_kg "
+                    "must be a non-negative finite number"
+                )
+
+            set_payloads.append({"reps": completed_set.reps, "weight_kg": weight_kg})
+
+        exercise_ids.append(exercise.exercise_id)
+        serialized_sets.append(set_payloads)
+
+    stored_exercises = {
+        exercise_id: name
+        for exercise_id, name in session.execute(
+            select(Exercise.id, Exercise.name).where(Exercise.id.in_(exercise_ids))
+        ).all()
+    }
+    missing_exercise_ids = tuple(
+        exercise_id
+        for exercise_id in dict.fromkeys(exercise_ids)
+        if exercise_id not in stored_exercises
+    )
+    if missing_exercise_ids:
+        missing = ", ".join(str(exercise_id) for exercise_id in missing_exercise_ids)
+        raise LookupError(f"Unknown exercise IDs: {missing}")
+
+    return [
+        {
+            "exercise_id": str(exercise.exercise_id),
+            "name": stored_exercises[exercise.exercise_id],
+            "sets": set_payloads,
+        }
+        for exercise, set_payloads in zip(exercises, serialized_sets, strict=True)
+    ]
+
+
+def log_workout(
+    session: Session,
+    member_id: UUID,
+    exercises: tuple[WorkoutExerciseInput, ...],
+    event_time: datetime,
+    *,
+    note: str | None = None,
+) -> WorkoutLog:
+    """Append one completed workout to its member-local calendar date."""
+
+    day = _member_local_date(session, member_id, event_time)
+    exercises_payload = _workout_exercises_payload(session, exercises)
+    workout_log = WorkoutLog(
+        member_id=member_id,
+        log_date=day,
+        exercises=exercises_payload,
+        recorded_at=event_time.astimezone(timezone.utc),
+        note=note,
+    )
+    session.add(workout_log)
+    session.flush()
+    return workout_log
+
+
+def get_workouts_for_day(
+    session: Session,
+    member_id: UUID,
+    day: date,
+) -> tuple[WorkoutLog, ...]:
+    """Return one member's workouts for one local calendar date."""
+
+    return tuple(
+        session.scalars(
+            select(WorkoutLog)
+            .where(WorkoutLog.member_id == member_id, WorkoutLog.log_date == day)
+            .order_by(WorkoutLog.recorded_at, WorkoutLog.id)
+        ).all()
+    )
+
+
+def _validated_workout_history_limit(limit: int) -> int:
+    """Require an explicit positive bound for workout-history reads."""
+
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("limit must be a positive integer")
+    return limit
+
+
+def get_recent_workouts(
+    session: Session,
+    member_id: UUID,
+    *,
+    limit: int = 10,
+) -> tuple[WorkoutLog, ...]:
+    """Return a member's most recent workouts in reverse chronological order."""
+
+    validated_limit = _validated_workout_history_limit(limit)
+    return tuple(
+        session.scalars(
+            select(WorkoutLog)
+            .where(WorkoutLog.member_id == member_id)
+            .order_by(
+                WorkoutLog.log_date.desc(),
+                WorkoutLog.recorded_at.desc(),
+                WorkoutLog.id.desc(),
+            )
+            .limit(validated_limit)
+        ).all()
+    )
+
+
+def _workout_contains_exercise(workout: WorkoutLog, exercise_id: UUID) -> bool:
+    """Return whether one stored workout contains the canonical exercise ID."""
+
+    expected_id = str(exercise_id)
+    return any(
+        isinstance(exercise, dict) and exercise.get("exercise_id") == expected_id
+        for exercise in workout.exercises
+    )
+
+
+def get_exercise_history(
+    session: Session,
+    member_id: UUID,
+    exercise_id: UUID,
+    *,
+    limit: int = 10,
+) -> tuple[WorkoutLog, ...]:
+    """Return recent member workouts containing one canonical exercise."""
+
+    if not isinstance(exercise_id, UUID):
+        raise ValueError("exercise_id must be a UUID")
+    validated_limit = _validated_workout_history_limit(limit)
+    ordered_workouts = session.scalars(
+        select(WorkoutLog)
+        .where(WorkoutLog.member_id == member_id)
+        .order_by(
+            WorkoutLog.log_date.desc(),
+            WorkoutLog.recorded_at.desc(),
+            WorkoutLog.id.desc(),
+        )
+    )
+
+    matching_workouts: list[WorkoutLog] = []
+    for workout in ordered_workouts:
+        if _workout_contains_exercise(workout, exercise_id):
+            matching_workouts.append(workout)
+            if len(matching_workouts) == validated_limit:
+                break
+    return tuple(matching_workouts)
+
+
 def get_day_state(session: Session, member_id: UUID, day: date) -> DayState:
     """Return only records matching the requested member and local date."""
 
     bodyweight_log = get_bodyweight_for_day(session, member_id, day)
     food_logs = get_food_for_day(session, member_id, day)
     food_totals = _sum_food_totals(food_logs)
-    workout_logs = tuple(
-        session.scalars(
-            select(WorkoutLog)
-            .where(WorkoutLog.member_id == member_id, WorkoutLog.log_date == day)
-            .order_by(WorkoutLog.created_at, WorkoutLog.id)
-        ).all()
-    )
+    workout_logs = get_workouts_for_day(session, member_id, day)
 
     return DayState(
         member_id=member_id,

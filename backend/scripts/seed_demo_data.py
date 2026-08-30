@@ -355,11 +355,16 @@ def add_history(session: Session, members: dict[str, Member], plans: dict[str, W
             frequency = profile["workouts_per_week"]
             should_train = weekday in ({1: {2}, 3: {0, 2, 4}, 4: {0, 1, 3, 5}}[frequency])
             if should_train:
+                workout_recorded_at = datetime.combine(
+                    log_date,
+                    time(hour=18),
+                    tzinfo=member_timezone,
+                ).astimezone(timezone.utc)
                 performance: list[dict[str, Any]] = []
                 for index, name in enumerate(workout_names):
                     base_weight = 45 + index * 15 + day_offset // 7 * 2
                     performance.append({"exercise_id": str(exercises[name].id), "name": name, "sets": [{"weight_kg": base_weight, "reps": 8 + index, "rpe": 7.5, "note": None}], "superset_group": None})
-                session.add(WorkoutLog(member_id=member.id, log_date=log_date, plan_id=plan.id, exercises=performance, source="whatsapp"))
+                session.add(WorkoutLog(member_id=member.id, log_date=log_date, plan_id=plan.id, exercises=performance, recorded_at=workout_recorded_at, source="whatsapp"))
 
 
 def add_trend_flags(session: Session, members: dict[str, Member], now: datetime) -> None:

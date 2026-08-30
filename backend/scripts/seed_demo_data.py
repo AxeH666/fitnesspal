@@ -6,11 +6,12 @@ members already exist, so it is safe to run repeatedly.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import sys
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -297,12 +298,26 @@ def add_history(session: Session, members: dict[str, Member], plans: dict[str, W
     workout_names = ("Barbell Back Squat", "Barbell Bench Press", "Barbell Row")
     for profile in DEMO_MEMBERS:
         today = local_date(now, profile["timezone"])
+        member_timezone = ZoneInfo(profile["timezone"])
         member = members[profile["email"]]
         plan = plans[str(member.id)]
         for day_offset in range(28):
             log_date = today - timedelta(days=27 - day_offset)
             weight = profile["start_weight"] + profile["daily_delta"] * Decimal(day_offset)
-            session.add(BodyweightLog(member_id=member.id, log_date=log_date, weight_kg=weight.quantize(Decimal("0.01")), source="app"))
+            recorded_at = datetime.combine(
+                log_date,
+                time(hour=12),
+                tzinfo=member_timezone,
+            ).astimezone(timezone.utc)
+            session.add(
+                BodyweightLog(
+                    member_id=member.id,
+                    log_date=log_date,
+                    weight_kg=weight.quantize(Decimal("0.01")),
+                    recorded_at=recorded_at,
+                    source="app",
+                )
+            )
             for meal_type in ("breakfast", "lunch", "dinner"):
                 items, totals = meal_payload(profile, day_offset, meal_type)
                 session.add(FoodLog(member_id=member.id, log_date=log_date, meal_type=meal_type, items=items, totals=totals, source="whatsapp"))

@@ -254,7 +254,7 @@ def add_members(session: Session, now: datetime) -> dict[str, Member]:
         session.add_all([
             Subscription(member_id=member.id, tier=profile["tier"], status=profile["status"], started_at=now - timedelta(days=60), expires_at=now + timedelta(days=30), payment_provider="manual", payment_ref=f"DEMO-{member.id.hex[:8]}"),
             MemberProfile(member_id=member.id, goal=profile["goal"], activity_level=profile["activity"], training_experience=profile["experience"], injuries_limitations=None, preferred_days_per_week=profile["days"], preferred_split=profile["split"], dietary_preferences=profile["diet"], timezone=profile["timezone"], whatsapp_linked=True, whatsapp_phone=profile["phone"], whatsapp_verified_at=now, onboarding_completed_at=now - timedelta(days=60)),
-            MemberNutritionTarget(member_id=member.id, bmr_kcal=profile["bmr"], tdee_kcal=profile["tdee"], calorie_target_kcal=profile["calories"], protein_target_g=profile["protein"], fat_target_g=profile["fat"], carb_target_g=profile["carbs"], calculated_at=now),
+            MemberNutritionTarget(member_id=member.id, bmr_kcal=profile["bmr"], tdee_kcal=profile["tdee"], calorie_target_kcal=profile["calories"], recommended_protein_target_g=None, active_protein_target_g=None, fat_target_g=profile["fat"], carb_target_g=profile["carbs"], calculated_at=now),
             AuditLog(member_id=member.id, action="seed_member", entity_type="member", entity_id=member.id, after={"email": member.email, "goal": profile["goal"]}, source="system", actor="system"),
         ])
     return members

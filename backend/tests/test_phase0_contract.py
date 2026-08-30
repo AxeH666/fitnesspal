@@ -56,6 +56,27 @@ class PhaseZeroContractTests(unittest.TestCase):
                     for nutrient in expected_totals:
                         self.assertEqual(items[0][nutrient], totals[nutrient])
 
+    def test_seed_does_not_preselect_a_protein_target(self) -> None:
+        tree = ast.parse(SEED_SCRIPT.read_text(encoding="utf-8"))
+        target_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "MemberNutritionTarget"
+        ]
+
+        self.assertEqual(len(target_calls), 1)
+        keywords = {keyword.arg: keyword.value for keyword in target_calls[0].keywords}
+        for field_name in (
+            "recommended_protein_target_g",
+            "active_protein_target_g",
+        ):
+            value = keywords[field_name]
+            self.assertIsInstance(value, ast.Constant)
+            assert isinstance(value, ast.Constant)
+            self.assertIsNone(value.value)
+
 
 if __name__ == "__main__":
     unittest.main()

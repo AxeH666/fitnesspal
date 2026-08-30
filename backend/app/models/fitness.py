@@ -117,10 +117,14 @@ class MemberNutritionTarget(CreatedUpdatedAtMixin, Base):
     )
     bmr_kcal: Mapped[Decimal | None] = mapped_column(Numeric(7, 2))
     tdee_kcal: Mapped[Decimal | None] = mapped_column(Numeric(7, 2))
-    calorie_target_kcal: Mapped[int] = mapped_column(Integer, nullable=False)
-    protein_target_g: Mapped[int] = mapped_column(Integer, nullable=False)
-    fat_target_g: Mapped[int] = mapped_column(Integer, nullable=False)
-    carb_target_g: Mapped[int] = mapped_column(Integer, nullable=False)
+    calorie_target_kcal: Mapped[int | None] = mapped_column(Integer)
+    recommended_protein_target_g: Mapped[int | None] = mapped_column(Integer)
+    active_protein_target_g: Mapped[int | None] = mapped_column(
+        "protein_target_g",
+        Integer,
+    )
+    fat_target_g: Mapped[int | None] = mapped_column(Integer)
+    carb_target_g: Mapped[int | None] = mapped_column(Integer)
     calculated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

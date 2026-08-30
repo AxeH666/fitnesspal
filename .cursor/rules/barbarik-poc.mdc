@@ -20,6 +20,13 @@ Hard requirements:
 - Preserve working Phase 0 code unless replacement is justified.
 - PostgreSQL owns chronological fitness truth.
 - LLM conversation history is not authoritative storage.
+- Use the LLM as the primary reasoning engine for interpretation, advice, allowed estimation, explanation, and deciding whether a tool is needed.
+- Do not retrieve database state merely because member data exists. Open-ended advice, food options, meal ideas, substitutions, general fitness questions, and reasoning over the current interaction should be answered directly when exact personal state is not required.
+- Browsing or searching may be used only when current external information is genuinely useful and available agent tooling supports it. Do not add browsing infrastructure under this policy clarification.
+- A single reasoning flow may combine user-provided context, exact personal state retrieved from PostgreSQL, and relevant external search or browsing results. Retrieve only the sources needed for the question; search does not replace PostgreSQL as the source of truth for stored member facts.
+- Retrieve authoritative backend/database state whenever an answer depends on exact personal facts, chronology, persisted history, targets, totals, or day-specific records.
+- Every log, mutation, or target update must use an appropriate backend operation.
+- Never let the LLM invent exact personal history or stored values. When exact personal state is required, retrieve it; otherwise let the LLM answer directly.
 - Date handling must be deterministic and timezone-aware.
 - Minimum POC onboarding profile is age, weight, gender, and fitness goal, plus timezone where required for chronology.
 - Recommended protein target is calculated by deterministic backend logic; the LLM must not invent the authoritative value.

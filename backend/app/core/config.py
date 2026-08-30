@@ -2,11 +2,12 @@
 
 from functools import lru_cache
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Application settings required by the Phase 0 services."""
+    """Environment-backed settings for the Barbarik backend."""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -18,6 +19,8 @@ class Settings(BaseSettings):
     )
     redis_url: str = "redis://localhost:6379/0"
     log_level: str = "INFO"
+    gemini_api_key: SecretStr | None = None
+    gemini_model: str = "gemini-3.7-flash"
 
 
 @lru_cache(maxsize=1)
@@ -25,4 +28,3 @@ def get_settings() -> Settings:
     """Return a process-wide settings instance."""
 
     return Settings()
-

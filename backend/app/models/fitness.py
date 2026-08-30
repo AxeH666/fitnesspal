@@ -203,7 +203,7 @@ class WorkoutPlan(UUIDPrimaryKeyMixin, CreatedUpdatedAtMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
 
 
-class WorkoutLog(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+class WorkoutLog(UUIDPrimaryKeyMixin, Base):
     """A completed workout with exercises and per-set performance."""
 
     __tablename__ = "workout_logs"
@@ -215,6 +215,12 @@ class WorkoutLog(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     log_date: Mapped[date] = mapped_column(Date, nullable=False)
     plan_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("workout_plans.id"))
     exercises: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        "created_at",
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
     source: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'whatsapp'"))
     note: Mapped[str | None] = mapped_column(Text)
 

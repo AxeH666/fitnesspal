@@ -1,0 +1,13 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  color: #171717;
+  background: #ffffff;
+}
+
+body { margin: 0; }
+.phase-zero { display: grid; min-height: 100vh; place-items: center; }
+

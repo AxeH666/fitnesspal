@@ -310,6 +310,8 @@ If no calorie target has been set, Barbarik reasons from the active protein targ
 
 An active protein target is required for the personalized, state-dependent version of this feature. See section 2.
 
+For example, for "I have chicken, rice, eggs and curd. What can I make?", Barbarik may use the groceries directly from the message, retrieve exact remaining calories or protein if relevant, search for useful external or current information if needed, and combine only those inputs into a personalized recommendation.
+
 ---
 
 # 9. Target Changes
@@ -498,6 +500,8 @@ The LLM should normally answer directly, without personal database retrieval, wh
 - reasoning over information already supplied in the current interaction or available context
 
 When current external information is genuinely useful, the LLM may use browsing or search if the available agent tooling supports it. This policy does not add a browsing requirement or browsing infrastructure to the POC.
+
+A single reasoning flow may combine user-provided context, exact personal state retrieved from PostgreSQL, and relevant external search or browsing results. The agent should retrieve only the sources needed for the question. PostgreSQL remains authoritative for exact personal state and history; search is for external or current information and does not replace stored member facts.
 
 Backend or PostgreSQL retrieval is required when the answer depends on exact personal state, chronology, or persisted history. Examples include:
 

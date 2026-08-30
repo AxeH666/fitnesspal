@@ -149,9 +149,11 @@ Do not retrieve database state merely because member data exists. Answer directl
 
 Browsing or searching may be used when current external information is genuinely useful and available agent tooling supports it. This policy does not authorize adding browsing infrastructure or expand the POC scope.
 
+A single reasoning flow may combine user-provided context, exact personal state retrieved from PostgreSQL, and relevant external search or browsing results. Retrieve only the sources needed for the question. PostgreSQL remains authoritative for exact personal state and history; search is for external or current information and does not replace stored member facts.
+
 Retrieve authoritative state before answering when the result depends on exact personal facts, chronology, or persistence. This includes:
 
-- today's remaining protein or consumed calories
+- today's remaining protein, calories, or macros and consumed totals
 - yesterday's meals or training
 - the last performance of an exercise
 - comparisons between bodyweight records

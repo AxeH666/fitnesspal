@@ -8,4 +8,10 @@ warn_unused_ignores = true
 warn_return_any = true
 disallow_any_generics = true
 exclude = ["alembic/versions"]
+follow_imports_for_stubs = true
 
+# google-genai's optional image annotations can reach newer local NumPy stubs
+# even though this text-only adapter does not use NumPy.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"

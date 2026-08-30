@@ -97,6 +97,7 @@ class MemberProfile(CreatedUpdatedAtMixin, Base):
     preferred_days_per_week: Mapped[int | None] = mapped_column(Integer)
     preferred_split: Mapped[str | None] = mapped_column(String(30))
     dietary_preferences: Mapped[str | None] = mapped_column(Text)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
     unit_system: Mapped[str] = mapped_column(String(10), nullable=False, server_default=text("'metric'"))
     whatsapp_linked: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     whatsapp_phone: Mapped[str | None] = mapped_column(String(20))
@@ -237,4 +238,3 @@ class AuditLog(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     after: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     source: Mapped[str | None] = mapped_column(String(20))
     actor: Mapped[str | None] = mapped_column(String(50))
-

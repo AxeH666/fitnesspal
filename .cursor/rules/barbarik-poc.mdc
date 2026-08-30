@@ -1,0 +1,32 @@
+---
+description: Barbarik POC v1 scope and engineering guardrails
+alwaysApply: true
+---
+
+The active product target is Barbarik POC v1.
+
+Read `docs/POC-v1.md` before planning or implementing Barbarik work.
+
+Read `AGENTS.md` and obey its engineering and Git rules.
+
+Hard requirements:
+
+- Never work directly on main.
+- Every implementation change goes through a branch and Pull Request.
+- Do not add features outside the approved POC specification. Approval means `docs/POC-v1.md` is updated first; a chat "yes" is not authorization.
+- Prefer the smallest reliable implementation.
+- Do not overengineer.
+- Do not add infrastructure for hypothetical future requirements.
+- Preserve working Phase 0 code unless replacement is justified.
+- PostgreSQL owns chronological fitness truth.
+- LLM conversation history is not authoritative storage.
+- Date handling must be deterministic and timezone-aware.
+- Minimum POC onboarding profile is age, weight, gender, and fitness goal, plus timezone where required for chronology.
+- Recommended protein target is calculated by deterministic backend logic; the LLM must not invent the authoritative value.
+- Store both the backend recommendation and the user's accepted or overridden active target.
+- Workout-intensity tile scores are deterministic from stored data, never chosen by the LLM.
+- Dashboard shows only the member fields listed in `docs/POC-v1.md`; do not add extra profile fields.
+- Video analysis is required for the POC, but must use an existing capable model rather than a custom CV system.
+- The dashboard is a local demo website, not a production application.
+- Never commit secrets.
+- If a requested change appears to cause scope drift, explicitly warn the user before implementing it.

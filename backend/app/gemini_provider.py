@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import StrEnum
 import json
 from typing import Any, Protocol, Self, cast
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
+import httpx
 from pydantic import SecretStr, ValidationError
 
 from app.agent_loop import (
@@ -21,12 +24,117 @@ from app.agent_loop import (
 from app.core.config import Settings, get_settings
 
 
+class GeminiFailureCategory(StrEnum):
+    """Safe, non-sensitive classifications for local diagnostics."""
+
+    RATE_LIMIT = "rate_limit"
+    TIMEOUT_NETWORK = "timeout_network"
+    AUTHENTICATION = "authentication"
+    PROVIDER_ERROR = "provider_error"
+
+
 class GeminiConfigurationError(ValueError):
     """Raised when the Gemini provider cannot be configured safely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: GeminiFailureCategory = GeminiFailureCategory.PROVIDER_ERROR,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
 
 
 class GeminiProviderError(RuntimeError):
     """Raised when Gemini fails before a usable model turn is available."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: GeminiFailureCategory = GeminiFailureCategory.PROVIDER_ERROR,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+
+
+_RATE_LIMIT_STATUSES = frozenset(
+    {"RATE_LIMIT_EXCEEDED", "RESOURCE_EXHAUSTED"}
+)
+_RATE_LIMIT_REASONS = frozenset({"RATE_LIMIT_EXCEEDED", "QUOTA_EXCEEDED"})
+_TIMEOUT_STATUSES = frozenset(
+    {"DEADLINE_EXCEEDED", "GATEWAY_TIMEOUT", "REQUEST_TIMEOUT"}
+)
+_AUTHENTICATION_STATUSES = frozenset(
+    {"AUTHENTICATION", "PERMISSION_DENIED", "UNAUTHENTICATED"}
+)
+
+
+def _normalized_api_error_reasons(error: genai_errors.APIError) -> tuple[str, ...]:
+    """Read only whitelisted structured reason fields from an SDK error."""
+
+    payload = error.details
+    if not isinstance(payload, dict):
+        return ()
+    nested_error = payload.get("error")
+    if isinstance(nested_error, dict):
+        payload = nested_error
+    raw_details = payload.get("details")
+    if not isinstance(raw_details, list):
+        return ()
+
+    reasons: list[str] = []
+    for detail in raw_details:
+        if not isinstance(detail, dict):
+            continue
+        reason = detail.get("reason")
+        if isinstance(reason, str):
+            reasons.append(reason.strip().upper())
+    return tuple(reasons)
+
+
+def _classify_known_gemini_failure(error: Exception) -> GeminiFailureCategory:
+    if isinstance(error, genai_errors.APIError):
+        status = error.status
+        normalized_status = (
+            status.strip().upper() if isinstance(status, str) else ""
+        )
+        reasons = _normalized_api_error_reasons(error)
+        if (
+            error.code == 429
+            or normalized_status in _RATE_LIMIT_STATUSES
+            or any(reason in _RATE_LIMIT_REASONS for reason in reasons)
+        ):
+            return GeminiFailureCategory.RATE_LIMIT
+        if (
+            error.code in (408, 504)
+            or normalized_status in _TIMEOUT_STATUSES
+        ):
+            return GeminiFailureCategory.TIMEOUT_NETWORK
+        if (
+            error.code in (401, 403)
+            or normalized_status in _AUTHENTICATION_STATUSES
+            or any(reason.startswith("API_KEY_") for reason in reasons)
+        ):
+            return GeminiFailureCategory.AUTHENTICATION
+        return GeminiFailureCategory.PROVIDER_ERROR
+
+    if isinstance(
+        error,
+        (httpx.TransportError, TimeoutError, ConnectionError),
+    ):
+        return GeminiFailureCategory.TIMEOUT_NETWORK
+    return GeminiFailureCategory.PROVIDER_ERROR
+
+
+def _classify_gemini_failure(error: Exception) -> GeminiFailureCategory:
+    """Reduce an upstream failure to a safe category and retain nothing else."""
+
+    try:
+        return _classify_known_gemini_failure(error)
+    except Exception:
+        return GeminiFailureCategory.PROVIDER_ERROR
 
 
 class _GeminiChat(Protocol):
@@ -88,7 +196,10 @@ class GeminiModelProvider:
     ) -> None:
         raw_api_key = "" if api_key is None else api_key.get_secret_value().strip()
         if not raw_api_key:
-            raise GeminiConfigurationError("GEMINI_API_KEY is required")
+            raise GeminiConfigurationError(
+                "GEMINI_API_KEY is required",
+                category=GeminiFailureCategory.AUTHENTICATION,
+            )
         if not isinstance(model, str) or not model.strip():
             raise GeminiConfigurationError("GEMINI_MODEL must be non-empty")
 
@@ -96,16 +207,19 @@ class GeminiModelProvider:
         self._owns_client = client is None
         resolved_client = client
         if resolved_client is None:
+            failure_category = GeminiFailureCategory.PROVIDER_ERROR
             try:
                 resolved_client = cast(
                     _GeminiClient,
                     genai.Client(api_key=raw_api_key),
                 )
-            except Exception:
+            except Exception as error:
+                failure_category = _classify_gemini_failure(error)
                 resolved_client = None
             if resolved_client is None:
                 raise GeminiConfigurationError(
-                    "Gemini client initialization failed"
+                    "Gemini client initialization failed",
+                    category=failure_category,
                 )
         self._client = resolved_client
         self._active_run: _ActiveRun | None = None
@@ -131,13 +245,16 @@ class GeminiModelProvider:
         self._active_run = None
         self._closed = True
         if self._owns_client:
-            close_failed = False
+            failure_category: GeminiFailureCategory | None = None
             try:
                 self._client.close()
-            except Exception:
-                close_failed = True
-            if close_failed:
-                raise GeminiProviderError("Gemini client close failed")
+            except Exception as error:
+                failure_category = _classify_gemini_failure(error)
+            if failure_category is not None:
+                raise GeminiProviderError(
+                    "Gemini client close failed",
+                    category=failure_category,
+                )
 
     def _abort_run(self) -> None:
         self._active_run = None
@@ -346,12 +463,16 @@ class GeminiModelProvider:
         chat: _GeminiChat,
         message: str | list[types.Part],
     ) -> types.GenerateContentResponse:
+        failure_category = GeminiFailureCategory.PROVIDER_ERROR
         try:
             return chat.send_message(message)
-        except Exception:
-            pass
+        except Exception as error:
+            failure_category = _classify_gemini_failure(error)
         self._abort_run()
-        raise GeminiProviderError("Gemini request failed")
+        raise GeminiProviderError(
+            "Gemini request failed",
+            category=failure_category,
+        )
 
     def _retain_if_needed(
         self,
@@ -399,15 +520,19 @@ class GeminiModelProvider:
                 self._has_started = True
                 config = self._request_config(system_instruction, tools)
                 chat: _GeminiChat | None = None
+                failure_category = GeminiFailureCategory.PROVIDER_ERROR
                 try:
                     chat = self._client.chats.create(
                         model=self._model,
                         config=config,
                     )
-                except Exception:
-                    pass
+                except Exception as error:
+                    failure_category = _classify_gemini_failure(error)
                 if chat is None:
-                    raise GeminiProviderError("Gemini request failed")
+                    raise GeminiProviderError(
+                        "Gemini request failed",
+                        category=failure_category,
+                    )
                 response = self._send(chat, user_message)
             else:
                 if tools != active_run.tools:

@@ -35,6 +35,22 @@ from app.models import Member  # noqa: E402
 _DEFAULT_MEMBER_EMAIL = "rajesh.demo@barbarik.local"
 
 
+def _safe_gemini_failure_message(
+    error: GeminiConfigurationError | GeminiProviderError,
+    app_env: str,
+) -> str:
+    """Render fixed safe text, with a category only in local development."""
+
+    message = (
+        "Gemini configuration failed"
+        if isinstance(error, GeminiConfigurationError)
+        else "Gemini provider failed"
+    )
+    if app_env.strip().casefold() != "development":
+        return message
+    return f"{message} [category={error.category.value}]"
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Send one request through the local Barbarik Gemini loop."
@@ -65,40 +81,57 @@ def main() -> int:
     try:
         provider = GeminiModelProvider.from_settings(settings)
     except GeminiConfigurationError as error:
-        print(f"Smoke test could not start: {error}", file=sys.stderr)
+        failure = _safe_gemini_failure_message(error, settings.app_env)
+        print(f"Smoke test could not start: {failure}", file=sys.stderr)
         return 2
 
+    exit_code = 0
     try:
         try:
             member_id = _member_id(args.member_email)
-        except LookupError as error:
-            print(f"Smoke test could not start: {error}", file=sys.stderr)
-            return 2
+        except LookupError:
+            print("Smoke test could not start: member not found", file=sys.stderr)
+            exit_code = 2
         except SQLAlchemyError:
             print(
                 "Smoke test could not reach the local seeded database",
                 file=sys.stderr,
             )
-            return 2
-
-        backend_tools = BarbarikAgentTools(
-            SessionLocal,
-            member_id,
-            datetime.now(timezone.utc),
+            exit_code = 2
+        else:
+            backend_tools = BarbarikAgentTools(
+                SessionLocal,
+                member_id,
+                datetime.now(timezone.utc),
+            )
+            response = BarbarikReasoningLoop(provider, backend_tools).respond(
+                args.message
+            )
+            print(response)
+    except GeminiProviderError as error:
+        print(
+            _safe_gemini_failure_message(error, settings.app_env),
+            file=sys.stderr,
         )
-        response = BarbarikReasoningLoop(provider, backend_tools).respond(args.message)
-        print(response)
+        exit_code = 1
     except (
         AgentLoopLimitError,
         AgentProtocolError,
-        GeminiProviderError,
         ToolExecutionError,
     ) as error:
         print(str(error), file=sys.stderr)
-        return 1
+        exit_code = 1
     finally:
-        provider.close()
-    return 0
+        try:
+            provider.close()
+        except GeminiProviderError as error:
+            print(
+                _safe_gemini_failure_message(error, settings.app_env),
+                file=sys.stderr,
+            )
+            if exit_code == 0:
+                exit_code = 1
+    return exit_code
 
 
 if __name__ == "__main__":

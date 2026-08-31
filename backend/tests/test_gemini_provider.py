@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+import io
 import json
 import os
 import traceback
@@ -12,7 +15,9 @@ from typing import cast
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+from google.genai import errors as genai_errors
 from google.genai import types
+import httpx
 from pydantic import SecretStr
 from sqlalchemy.orm import Session
 
@@ -29,9 +34,12 @@ from app.agent_tools import BarbarikAgentTools
 from app.core.config import Settings
 from app.gemini_provider import (
     GeminiConfigurationError,
+    GeminiFailureCategory,
     GeminiModelProvider,
     GeminiProviderError,
 )
+import scripts.smoke_gemini_agent as smoke_gemini_agent
+from scripts.smoke_gemini_agent import _safe_gemini_failure_message
 
 
 GeminiMessage = str | list[types.Part]
@@ -122,14 +130,28 @@ NO_ARGUMENT_TOOL = ToolDefinition(
 class GeminiProviderTests(unittest.TestCase):
     """Verify serialization, mapping, continuation, and safe failures."""
 
-    def _assert_secret_detached(
+    def _assert_failure_is_safe(
         self,
         error: BaseException,
-        secret: str,
+        *sensitive_values: str,
     ) -> None:
         self.assertIsNone(error.__cause__)
         self.assertIsNone(error.__context__)
-        self.assertNotIn(secret, repr(error))
+        surfaces = (
+            str(error),
+            repr(error),
+            json.dumps(vars(error), default=str),
+            "".join(
+                traceback.format_exception(
+                    type(error),
+                    error,
+                    error.__traceback__,
+                )
+            ),
+        )
+        for sensitive_value in sensitive_values:
+            for surface in surfaces:
+                self.assertNotIn(sensitive_value, surface)
 
     def _provider(
         self,
@@ -559,6 +581,327 @@ class GeminiProviderTests(unittest.TestCase):
                         tools=(NO_ARGUMENT_TOOL,),
                     )
 
+    def test_sdk_failures_are_classified_without_retaining_upstream_data(self) -> None:
+        api_key = "sensitive-api-key"
+        prompt = "sensitive-user-prompt"
+        personal_data = "member@example.test weighs 79.4 kg"
+        raw_response = "raw-provider-response-body"
+        sensitive_values = (api_key, prompt, personal_data, raw_response)
+        request = httpx.Request(
+            "POST",
+            f"https://generativelanguage.googleapis.test/models?key={api_key}",
+            content=prompt,
+        )
+
+        def api_failure(
+            code: int,
+            status: str,
+            *,
+            reason: str | None = None,
+        ) -> genai_errors.APIError:
+            response_json = {
+                "error": {
+                    "code": code,
+                    "status": status,
+                    "message": f"{personal_data}; {raw_response}",
+                    "details": [
+                        {
+                            "reason": reason,
+                            "metadata": {"raw": raw_response},
+                        }
+                    ],
+                }
+            }
+            response = httpx.Response(
+                code,
+                request=request,
+                json=response_json,
+            )
+            if 400 <= code < 500:
+                return genai_errors.ClientError(code, response_json, response)
+            return genai_errors.ServerError(code, response_json, response)
+
+        hostile_details = MagicMock(spec=dict)
+        hostile_details.get.side_effect = RuntimeError(raw_response)
+        hostile_api_error = genai_errors.ClientError(400, {})
+        hostile_api_error.details = hostile_details
+        failures = (
+            (
+                api_failure(429, "RESOURCE_EXHAUSTED"),
+                GeminiFailureCategory.RATE_LIMIT,
+            ),
+            (
+                api_failure(
+                    400,
+                    "INVALID_ARGUMENT",
+                    reason="API_KEY_INVALID",
+                ),
+                GeminiFailureCategory.AUTHENTICATION,
+            ),
+            (
+                api_failure(401, "UNAUTHENTICATED"),
+                GeminiFailureCategory.AUTHENTICATION,
+            ),
+            (
+                api_failure(403, "PERMISSION_DENIED"),
+                GeminiFailureCategory.AUTHENTICATION,
+            ),
+            (
+                api_failure(408, "DEADLINE_EXCEEDED"),
+                GeminiFailureCategory.TIMEOUT_NETWORK,
+            ),
+            (
+                api_failure(500, "INTERNAL"),
+                GeminiFailureCategory.PROVIDER_ERROR,
+            ),
+            (
+                httpx.ReadTimeout(
+                    f"{personal_data}; {raw_response}",
+                    request=request,
+                ),
+                GeminiFailureCategory.TIMEOUT_NETWORK,
+            ),
+            (
+                httpx.ConnectError(
+                    f"{personal_data}; {raw_response}",
+                    request=request,
+                ),
+                GeminiFailureCategory.TIMEOUT_NETWORK,
+            ),
+            (
+                RuntimeError(f"{personal_data}; {raw_response}"),
+                GeminiFailureCategory.PROVIDER_ERROR,
+            ),
+            (
+                hostile_api_error,
+                GeminiFailureCategory.PROVIDER_ERROR,
+            ),
+        )
+
+        for upstream_error, expected_category in failures:
+            with self.subTest(
+                upstream_type=type(upstream_error).__name__,
+                expected_category=expected_category,
+            ):
+                provider, client, chat = self._provider(upstream_error)
+                with self.assertRaises(GeminiProviderError) as raised:
+                    provider.complete(
+                        messages=_messages(prompt),
+                        tools=(NO_ARGUMENT_TOOL,),
+                    )
+
+                error = raised.exception
+                self.assertEqual(str(error), "Gemini request failed")
+                self.assertEqual(error.category, expected_category)
+                self.assertEqual(vars(error), {"category": expected_category})
+                self._assert_failure_is_safe(error, *sensitive_values)
+                self.assertEqual(len(client.chats.requests), 1)
+                self.assertEqual(len(chat.messages), 1)
+
+    def test_failed_continuation_discards_personal_state_without_retrying(self) -> None:
+        personal_data = "member@example.test last weighed 79.4 kg"
+        provider, client, chat = self._provider(
+            _response(
+                types.Part(
+                    function_call=types.FunctionCall(
+                        id="personal-state-1",
+                        name="get_today_state",
+                        args={},
+                    )
+                )
+            ),
+            RuntimeError(f"upstream echoed {personal_data}"),
+        )
+        initial = _messages("What have I logged today?")
+        first_turn = provider.complete(
+            messages=initial,
+            tools=(NO_ARGUMENT_TOOL,),
+        )
+        continuation = initial + (
+            ConversationMessage(
+                role="assistant",
+                tool_calls=first_turn.tool_calls,
+            ),
+            ConversationMessage(
+                role="tool",
+                content=json.dumps({"ok": True, "result": personal_data}),
+                tool_call_id="personal-state-1",
+                tool_name="get_today_state",
+            ),
+        )
+
+        with self.assertRaises(GeminiProviderError) as raised:
+            provider.complete(
+                messages=continuation,
+                tools=(NO_ARGUMENT_TOOL,),
+            )
+
+        self.assertEqual(
+            raised.exception.category,
+            GeminiFailureCategory.PROVIDER_ERROR,
+        )
+        self._assert_failure_is_safe(raised.exception, personal_data)
+        self.assertEqual(len(client.chats.requests), 1)
+        self.assertEqual(len(chat.messages), 2)
+        with self.assertRaisesRegex(GeminiProviderError, "request-scoped"):
+            provider.complete(
+                messages=_messages("Start another request"),
+                tools=(NO_ARGUMENT_TOOL,),
+            )
+        self.assertEqual(len(chat.messages), 2)
+
+    def test_safe_failure_category_is_rendered_only_for_local_development(self) -> None:
+        sensitive = "API-KEY prompt person@example.com raw-response"
+        cases = (
+            (
+                GeminiConfigurationError(
+                    sensitive,
+                    category=GeminiFailureCategory.AUTHENTICATION,
+                ),
+                "Gemini configuration failed",
+                "authentication",
+            ),
+            (
+                GeminiProviderError(
+                    sensitive,
+                    category=GeminiFailureCategory.RATE_LIMIT,
+                ),
+                "Gemini provider failed",
+                "rate_limit",
+            ),
+        )
+
+        for error, safe_message, category in cases:
+            with self.subTest(error_type=type(error).__name__):
+                self.assertEqual(
+                    _safe_gemini_failure_message(error, "development"),
+                    f"{safe_message} [category={category}]",
+                )
+                for app_env in ("production", "staging", "test", ""):
+                    self.assertEqual(
+                        _safe_gemini_failure_message(error, app_env),
+                        safe_message,
+                    )
+                for app_env in ("development", "production"):
+                    self.assertNotIn(
+                        sensitive,
+                        _safe_gemini_failure_message(error, app_env),
+                    )
+
+    def test_smoke_main_sanitizes_request_and_close_failures(self) -> None:
+        sensitive = "API-KEY prompt person@example.com raw-response"
+        cases = (
+            ("request", GeminiFailureCategory.RATE_LIMIT, "rate_limit"),
+            ("close", GeminiFailureCategory.TIMEOUT_NETWORK, "timeout_network"),
+        )
+
+        for failure_point, category, category_text in cases:
+            for app_env in ("development", "production"):
+                with self.subTest(failure_point=failure_point, app_env=app_env):
+                    provider = MagicMock(spec=GeminiModelProvider)
+                    loop = MagicMock()
+                    provider_error = GeminiProviderError(
+                        sensitive,
+                        category=category,
+                    )
+                    if failure_point == "request":
+                        loop.respond.side_effect = provider_error
+                    else:
+                        loop.respond.return_value = "safe response"
+                        provider.close.side_effect = provider_error
+                    settings = MagicMock()
+                    settings.app_env = app_env
+                    stderr = io.StringIO()
+                    stdout = io.StringIO()
+
+                    with (
+                        patch.object(
+                            smoke_gemini_agent,
+                            "_arguments",
+                            return_value=argparse.Namespace(
+                                message="hello",
+                                member_email="member@example.com",
+                            ),
+                        ),
+                        patch.object(
+                            smoke_gemini_agent,
+                            "get_settings",
+                            return_value=settings,
+                        ),
+                        patch.object(
+                            GeminiModelProvider,
+                            "from_settings",
+                            return_value=provider,
+                        ),
+                        patch.object(
+                            smoke_gemini_agent,
+                            "_member_id",
+                            return_value=uuid4(),
+                        ),
+                        patch.object(smoke_gemini_agent, "BarbarikAgentTools"),
+                        patch.object(
+                            smoke_gemini_agent,
+                            "BarbarikReasoningLoop",
+                            return_value=loop,
+                        ),
+                        redirect_stderr(stderr),
+                        redirect_stdout(stdout),
+                    ):
+                        exit_code = smoke_gemini_agent.main()
+
+                    expected = "Gemini provider failed"
+                    if app_env == "development":
+                        expected += f" [category={category_text}]"
+                    self.assertEqual(exit_code, 1)
+                    self.assertEqual(stderr.getvalue(), f"{expected}\n")
+                    self.assertNotIn(sensitive, stderr.getvalue())
+                    provider.close.assert_called_once_with()
+
+    def test_smoke_main_does_not_echo_missing_member_identity(self) -> None:
+        member_email = "private-member@example.test"
+        provider = MagicMock(spec=GeminiModelProvider)
+        settings = MagicMock()
+        settings.app_env = "production"
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+
+        with (
+            patch.object(
+                smoke_gemini_agent,
+                "_arguments",
+                return_value=argparse.Namespace(
+                    message="hello",
+                    member_email=member_email,
+                ),
+            ),
+            patch.object(
+                smoke_gemini_agent,
+                "get_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                GeminiModelProvider,
+                "from_settings",
+                return_value=provider,
+            ),
+            patch.object(
+                smoke_gemini_agent,
+                "_member_id",
+                side_effect=LookupError(member_email),
+            ),
+            redirect_stderr(stderr),
+            redirect_stdout(stdout),
+        ):
+            exit_code = smoke_gemini_agent.main()
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "Smoke test could not start: member not found\n",
+        )
+        self.assertNotIn(member_email, stderr.getvalue())
+        provider.close.assert_called_once_with()
+
     def test_sdk_failure_is_sanitized_and_does_not_leak_the_key(self) -> None:
         secret = "key-visible-only-inside-the-fake-sdk"
         chat = FakeChat([RuntimeError(f"upstream failure with {secret}")])
@@ -582,8 +925,12 @@ class GeminiProviderTests(unittest.TestCase):
             )
         )
         self.assertEqual(str(raised.exception), "Gemini request failed")
+        self.assertEqual(
+            raised.exception.category,
+            GeminiFailureCategory.PROVIDER_ERROR,
+        )
         self.assertNotIn(secret, rendered)
-        self._assert_secret_detached(raised.exception, secret)
+        self._assert_failure_is_safe(raised.exception, secret)
         self.assertNotIn(secret, repr(provider))
 
     def test_all_sdk_boundary_errors_detach_the_upstream_exception(self) -> None:
@@ -598,7 +945,11 @@ class GeminiProviderTests(unittest.TestCase):
                     api_key=SecretStr(secret),
                     model="gemini-test-model",
                 )
-        self._assert_secret_detached(initialization.exception, secret)
+        self.assertEqual(
+            initialization.exception.category,
+            GeminiFailureCategory.PROVIDER_ERROR,
+        )
+        self._assert_failure_is_safe(initialization.exception, secret)
 
         provider, client, _ = self._provider()
         with patch.object(
@@ -611,7 +962,11 @@ class GeminiProviderTests(unittest.TestCase):
                     messages=_messages(),
                     tools=(NO_ARGUMENT_TOOL,),
                 )
-        self._assert_secret_detached(creation.exception, secret)
+        self.assertEqual(
+            creation.exception.category,
+            GeminiFailureCategory.PROVIDER_ERROR,
+        )
+        self._assert_failure_is_safe(creation.exception, secret)
 
         sdk_client = MagicMock()
         sdk_client.close.side_effect = RuntimeError(secret)
@@ -625,7 +980,11 @@ class GeminiProviderTests(unittest.TestCase):
             )
         with self.assertRaises(GeminiProviderError) as closing:
             provider.close()
-        self._assert_secret_detached(closing.exception, secret)
+        self.assertEqual(
+            closing.exception.category,
+            GeminiFailureCategory.PROVIDER_ERROR,
+        )
+        self._assert_failure_is_safe(closing.exception, secret)
 
     def test_missing_or_blank_api_key_is_rejected_before_client_use(self) -> None:
         for api_key in (None, SecretStr(""), SecretStr("   ")):
@@ -633,12 +992,16 @@ class GeminiProviderTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     GeminiConfigurationError,
                     "GEMINI_API_KEY is required",
-                ):
+                ) as raised:
                     GeminiModelProvider(
                         api_key=api_key,
                         model="gemini-test-model",
                         client=FakeClient(FakeChat([])),
                     )
+                self.assertEqual(
+                    raised.exception.category,
+                    GeminiFailureCategory.AUTHENTICATION,
+                )
 
     def test_environment_settings_are_explicit_and_secret_is_redacted(self) -> None:
         secret = "environment-only-test-key"

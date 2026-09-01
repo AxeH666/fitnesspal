@@ -185,6 +185,7 @@ class AgentToolContractTests(unittest.TestCase):
             "get_recent_workouts",
             "get_today_food_totals",
             "get_today_state",
+            "get_yesterday_state",
             "get_workouts_for_day",
             "log_bodyweight",
             "log_food",
@@ -257,6 +258,14 @@ class AgentToolContractTests(unittest.TestCase):
                 "app.agent_tools.member_state.get_today_state",
                 state,
                 self.tools.get_today_state,
+                (self.session, self.member_id),
+                {"now": self.event_time},
+                False,
+            ),
+            (
+                "app.agent_tools.member_state.get_yesterday_state",
+                state,
+                self.tools.get_yesterday_state,
                 (self.session, self.member_id),
                 {"now": self.event_time},
                 False,
@@ -667,12 +676,25 @@ class AgentToolPersistenceTests(unittest.TestCase):
             "india-a",
         )
         self._assert_state(
+            india_reader.get_yesterday_state(),
+            date(2026, 8, 30),
+            "80.00",
+            400,
+            "india-a",
+        )
+        self._assert_state(
             new_york_reader.get_today_state(),
             date(2026, 8, 30),
             "90.00",
             900,
             "new-york",
         )
+        new_york_yesterday = new_york_reader.get_yesterday_state()
+        self.assertEqual(new_york_yesterday.local_date, date(2026, 8, 29))
+        self.assertIsNone(new_york_yesterday.bodyweight)
+        self.assertEqual(new_york_yesterday.food_logs, ())
+        self.assertEqual(new_york_yesterday.food_totals.calories, 0)
+        self.assertEqual(new_york_yesterday.workout_logs, ())
         self.assertEqual(india_reader.get_today_food_totals().protein_g, 40)
         self.assertEqual(
             india_reader.get_food_totals_for_day(date(2026, 8, 30)).calories,

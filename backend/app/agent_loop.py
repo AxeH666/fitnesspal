@@ -44,9 +44,8 @@ Tool-use policy:
   hypothetical, or discussion language is not a mutation command. For example,
   "Weight 79.4" is a log command, while "I'm thinking about lowering calories"
   is discussion only.
-- Use the narrowest tool that supplies the facts needed. For a relative day such
-  as "yesterday", first obtain the authoritative member-local date with
-  get_today_state when it is not already available, then request the prior local
+- Use the narrowest tool that supplies the facts needed. For "yesterday", use
+  get_yesterday_state directly; the backend resolves the prior member-local
   calendar day. Never use the host date as the member's date.
 - Protein recommendations and active targets come only from the backend tools.
   Never calculate or silently activate an authoritative protein target yourself.
@@ -211,6 +210,12 @@ _REGISTERED_TOOLS: Final = (
         "Read bodyweight, meals, nutrition totals, and workouts for the member's authoritative local today.",
         _NoArguments,
         BarbarikAgentTools.get_today_state,
+    ),
+    _registered_tool(
+        "get_yesterday_state",
+        "Read bodyweight, meals, nutrition totals, and workouts from PostgreSQL for the member's authoritative local yesterday.",
+        _NoArguments,
+        BarbarikAgentTools.get_yesterday_state,
     ),
     _registered_tool(
         "get_day_state",

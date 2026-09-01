@@ -39,7 +39,12 @@ from app.gemini_provider import (
     GeminiProviderError,
 )
 import scripts.smoke_gemini_agent as smoke_gemini_agent
-from scripts.smoke_gemini_agent import _safe_gemini_failure_message
+from scripts.smoke_gemini_agent import (
+    _TurnTimings,
+    _respond_with_timings,
+    _safe_gemini_failure_message,
+    _safe_timing_lines,
+)
 
 
 GeminiMessage = str | list[types.Part]
@@ -184,6 +189,14 @@ class GeminiProviderTests(unittest.TestCase):
         self.assertEqual(len(client.chats.requests), 1)
         model, config = client.chats.requests[0]
         self.assertEqual(model, "gemini-configured-model")
+        assert config.thinking_config is not None
+        self.assertEqual(
+            config.thinking_config.thinking_level,
+            types.ThinkingLevel.MINIMAL,
+        )
+        assert config.http_options is not None
+        self.assertEqual(config.http_options.timeout, 15_000)
+        self.assertIsNone(config.http_options.retry_options)
         request = config.model_dump(exclude_none=True)
         self.assertEqual(request["system_instruction"], "System policy")
         self.assertTrue(request["automatic_function_calling"]["disable"])
@@ -202,6 +215,69 @@ class GeminiProviderTests(unittest.TestCase):
         serialized_request = json.dumps(request)
         self.assertNotIn(secret, serialized_request)
         self.assertNotIn(secret, repr(provider))
+
+    def test_thinking_level_and_request_timeout_are_configurable(self) -> None:
+        _, client, _ = self._provider(
+            _response(types.Part(text="Configured answer."))
+        )
+        provider = GeminiModelProvider(
+            api_key=SecretStr("unit-test-key"),
+            model="gemini-configured-model",
+            thinking_level=" HIGH ",
+            request_timeout_ms=12_345,
+            client=client,
+        )
+
+        provider.complete(messages=_messages(), tools=(NO_ARGUMENT_TOOL,))
+
+        _, config = client.chats.requests[0]
+        assert config.thinking_config is not None
+        self.assertEqual(
+            config.thinking_config.thinking_level,
+            types.ThinkingLevel.HIGH,
+        )
+        assert config.http_options is not None
+        self.assertEqual(config.http_options.timeout, 12_345)
+        self.assertIsNone(config.http_options.retry_options)
+
+    def test_invalid_thinking_level_and_timeout_fail_before_client_use(self) -> None:
+        client = FakeClient(FakeChat([]))
+        for thinking_level in ("", "fast"):
+            with self.subTest(thinking_level=thinking_level):
+                with self.assertRaisesRegex(
+                    GeminiConfigurationError,
+                    "GEMINI_THINKING_LEVEL",
+                ):
+                    GeminiModelProvider(
+                        api_key=SecretStr("unit-test-key"),
+                        model="gemini-test-model",
+                        thinking_level=thinking_level,
+                        client=client,
+                    )
+        for timeout in (0, -1, True):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(
+                    GeminiConfigurationError,
+                    "GEMINI_REQUEST_TIMEOUT_MS",
+                ):
+                    GeminiModelProvider(
+                        api_key=SecretStr("unit-test-key"),
+                        model="gemini-test-model",
+                        request_timeout_ms=timeout,
+                        client=client,
+                    )
+        with self.assertRaisesRegex(
+            GeminiConfigurationError,
+            "does not support minimal thinking",
+        ):
+            GeminiModelProvider(
+                api_key=SecretStr("unit-test-key"),
+                model="gemini-3.7-flash",
+                thinking_level="minimal",
+                client=client,
+            )
+        self.assertEqual(client.close_calls, 0)
+        self.assertEqual(client.chats.requests, [])
 
     def test_text_mapping_omits_internal_thought_parts(self) -> None:
         provider, _, _ = self._provider(
@@ -468,13 +544,30 @@ class GeminiProviderTests(unittest.TestCase):
             uuid4(),
             datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc),
         )
+        timings = _TurnTimings()
+        clock_values = iter(
+            (
+                0,
+                1_000_000,
+                11_000_000,
+                12_000_000,
+                14_000_000,
+                15_000_000,
+                35_000_000,
+                40_000_000,
+            )
+        )
 
         with patch(
             "app.agent_tools.member_state.get_latest_bodyweight",
             return_value=None,
         ) as get_latest:
-            answer = BarbarikReasoningLoop(provider, tools).respond(
-                "What is my latest weight?"
+            answer = _respond_with_timings(
+                provider,
+                tools,
+                "What is my latest weight?",
+                timings,
+                clock=lambda: next(clock_values),
             )
 
         self.assertEqual(answer, "No bodyweight has been logged yet.")
@@ -486,6 +579,92 @@ class GeminiProviderTests(unittest.TestCase):
         assert function_response is not None
         self.assertEqual(function_response.id, "latest-1")
         self.assertEqual(function_response.response, {"ok": True, "result": None})
+        self.assertEqual(
+            timings,
+            _TurnTimings(
+                model_call_ns=[10_000_000, 20_000_000],
+                tool_ns=2_000_000,
+                tool_calls=1,
+                total_ns=40_000_000,
+            ),
+        )
+        self.assertEqual(
+            _safe_timing_lines(timings, "development"),
+            (
+                "model_1_ms=10.0",
+                "tool_ms=2.0",
+                "model_2_ms=20.0",
+                "total_ms=40.0",
+            ),
+        )
+
+    def test_direct_and_multi_round_timings_are_safe_and_unambiguous(self) -> None:
+        provider, _, _ = self._provider(
+            _response(types.Part(text="Direct answer."))
+        )
+        timings = _TurnTimings()
+        clock_values = iter((0, 1_000_000, 11_000_000, 12_000_000))
+
+        answer = _respond_with_timings(
+            provider,
+            MagicMock(spec=BarbarikAgentTools),
+            "General advice",
+            timings,
+            clock=lambda: next(clock_values),
+        )
+
+        self.assertEqual(answer, "Direct answer.")
+        self.assertEqual(
+            _safe_timing_lines(timings, "development"),
+            ("model_1_ms=10.0", "total_ms=12.0"),
+        )
+        self.assertEqual(_safe_timing_lines(timings, "production"), ())
+
+        multi_round = _TurnTimings(
+            model_call_ns=[10_000_000, 20_000_000, 30_000_000],
+            tool_ns=4_000_000,
+            tool_calls=2,
+            total_ns=70_000_000,
+        )
+        self.assertEqual(
+            _safe_timing_lines(multi_round, "development"),
+            (
+                "model_1_ms=10.0",
+                "tool_ms=4.0",
+                "model_2_ms=20.0",
+                "model_3_ms=30.0",
+                "total_ms=70.0",
+            ),
+        )
+
+    def test_failed_model_call_records_timing_without_changing_the_error(self) -> None:
+        failure = GeminiProviderError(
+            "Gemini request failed",
+            category=GeminiFailureCategory.TIMEOUT_NETWORK,
+        )
+        provider = MagicMock()
+        provider.complete.side_effect = failure
+        timings = _TurnTimings()
+        clock_values = iter((0, 1_000_000, 6_000_000, 10_000_000))
+
+        with self.assertRaises(GeminiProviderError) as raised:
+            _respond_with_timings(
+                provider,
+                MagicMock(spec=BarbarikAgentTools),
+                "sensitive prompt",
+                timings,
+                clock=lambda: next(clock_values),
+            )
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(
+            _safe_timing_lines(timings, "development"),
+            ("model_1_ms=5.0", "total_ms=10.0"),
+        )
+        self.assertNotIn(
+            "sensitive prompt",
+            "\n".join(_safe_timing_lines(timings, "development")),
+        )
 
     def test_malformed_gemini_responses_are_rejected(self) -> None:
         malformed = (
@@ -799,15 +978,15 @@ class GeminiProviderTests(unittest.TestCase):
             for app_env in ("development", "production"):
                 with self.subTest(failure_point=failure_point, app_env=app_env):
                     provider = MagicMock(spec=GeminiModelProvider)
-                    loop = MagicMock()
+                    respond_with_timings = MagicMock()
                     provider_error = GeminiProviderError(
                         sensitive,
                         category=category,
                     )
                     if failure_point == "request":
-                        loop.respond.side_effect = provider_error
+                        respond_with_timings.side_effect = provider_error
                     else:
-                        loop.respond.return_value = "safe response"
+                        respond_with_timings.return_value = "safe response"
                         provider.close.side_effect = provider_error
                     settings = MagicMock()
                     settings.app_env = app_env
@@ -841,8 +1020,8 @@ class GeminiProviderTests(unittest.TestCase):
                         patch.object(smoke_gemini_agent, "BarbarikAgentTools"),
                         patch.object(
                             smoke_gemini_agent,
-                            "BarbarikReasoningLoop",
-                            return_value=loop,
+                            "_respond_with_timings",
+                            respond_with_timings,
                         ),
                         redirect_stderr(stderr),
                         redirect_stdout(stdout),
@@ -855,7 +1034,75 @@ class GeminiProviderTests(unittest.TestCase):
                     self.assertEqual(exit_code, 1)
                     self.assertEqual(stderr.getvalue(), f"{expected}\n")
                     self.assertNotIn(sensitive, stderr.getvalue())
+                    respond_with_timings.assert_called_once()
                     provider.close.assert_called_once_with()
+
+    def test_smoke_main_emits_only_safe_development_timings(self) -> None:
+        sensitive = "prompt key member@example.test raw-tool-result"
+        provider = MagicMock(spec=GeminiModelProvider)
+        settings = MagicMock()
+        settings.app_env = "development"
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+
+        def respond_with_timings(
+            provider: object,
+            backend_tools: object,
+            user_message: str,
+            timings: _TurnTimings,
+        ) -> str:
+            timings.model_call_ns.extend((10_000_000, 20_000_000))
+            timings.tool_ns = 2_000_000
+            timings.tool_calls = 1
+            timings.total_ns = 35_000_000
+            return "safe response"
+
+        with (
+            patch.object(
+                smoke_gemini_agent,
+                "_arguments",
+                return_value=argparse.Namespace(
+                    message=sensitive,
+                    member_email="member@example.com",
+                ),
+            ),
+            patch.object(
+                smoke_gemini_agent,
+                "get_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                GeminiModelProvider,
+                "from_settings",
+                return_value=provider,
+            ),
+            patch.object(
+                smoke_gemini_agent,
+                "_member_id",
+                return_value=uuid4(),
+            ),
+            patch.object(smoke_gemini_agent, "BarbarikAgentTools"),
+            patch.object(
+                smoke_gemini_agent,
+                "_respond_with_timings",
+                side_effect=respond_with_timings,
+            ),
+            redirect_stderr(stderr),
+            redirect_stdout(stdout),
+        ):
+            exit_code = smoke_gemini_agent.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout.getvalue(), "safe response\n")
+        self.assertEqual(
+            stderr.getvalue(),
+            "model_1_ms=10.0\n"
+            "tool_ms=2.0\n"
+            "model_2_ms=20.0\n"
+            "total_ms=35.0\n",
+        )
+        self.assertNotIn(sensitive, stderr.getvalue())
+        provider.close.assert_called_once_with()
 
     def test_smoke_main_does_not_echo_missing_member_identity(self) -> None:
         member_email = "private-member@example.test"
@@ -1010,16 +1257,22 @@ class GeminiProviderTests(unittest.TestCase):
             {
                 "GEMINI_API_KEY": secret,
                 "GEMINI_MODEL": "gemini-env-model",
+                "GEMINI_THINKING_LEVEL": "high",
+                "GEMINI_REQUEST_TIMEOUT_MS": "4321",
             },
         ):
             settings = Settings()
 
         self.assertEqual(settings.gemini_model, "gemini-env-model")
+        self.assertEqual(settings.gemini_thinking_level, "high")
+        self.assertEqual(settings.gemini_request_timeout_ms, 4321)
         assert settings.gemini_api_key is not None
         self.assertEqual(settings.gemini_api_key.get_secret_value(), secret)
         self.assertNotIn(secret, repr(settings))
 
-        sdk_client = MagicMock()
+        sdk_client = FakeClient(
+            FakeChat([_response(types.Part(text="Configured response."))])
+        )
         with patch(
             "app.gemini_provider.genai.Client",
             return_value=sdk_client,
@@ -1027,8 +1280,17 @@ class GeminiProviderTests(unittest.TestCase):
             provider = GeminiModelProvider.from_settings(settings)
             constructor.assert_called_once_with(api_key=secret)
             self.assertNotIn(secret, repr(provider))
+            provider.complete(messages=_messages(), tools=(NO_ARGUMENT_TOOL,))
+            _, config = sdk_client.chats.requests[0]
+            assert config.thinking_config is not None
+            self.assertEqual(
+                config.thinking_config.thinking_level,
+                types.ThinkingLevel.HIGH,
+            )
+            assert config.http_options is not None
+            self.assertEqual(config.http_options.timeout, 4321)
             provider.close()
-        sdk_client.close.assert_called_once_with()
+        self.assertEqual(sdk_client.close_calls, 1)
 
 
 if __name__ == "__main__":

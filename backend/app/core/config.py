@@ -1,8 +1,9 @@
 """Runtime settings loaded from environment variables."""
 
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,7 +21,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     log_level: str = "INFO"
     gemini_api_key: SecretStr | None = None
-    gemini_model: str = "gemini-3.7-flash"
+    gemini_model: str = "gemini-3.5-flash-lite"
+    gemini_thinking_level: Literal[
+        "minimal", "low", "medium", "high"
+    ] = "minimal"
+    gemini_request_timeout_ms: int = Field(default=15_000, gt=0)
 
 
 @lru_cache(maxsize=1)

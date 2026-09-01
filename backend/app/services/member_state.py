@@ -1,7 +1,7 @@
 """Date-scoped reads of persisted member fitness state."""
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
 import math
@@ -540,3 +540,16 @@ def get_today_state(
 
     instant = now if now is not None else datetime.now(timezone.utc)
     return get_day_state(session, member_id, _member_local_date(session, member_id, instant))
+
+
+def get_yesterday_state(
+    session: Session,
+    member_id: UUID,
+    *,
+    now: datetime | None = None,
+) -> DayState:
+    """Return the prior member-local calendar day's persisted state."""
+
+    instant = now if now is not None else datetime.now(timezone.utc)
+    yesterday = _member_local_date(session, member_id, instant) - timedelta(days=1)
+    return get_day_state(session, member_id, yesterday)

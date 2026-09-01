@@ -69,6 +69,33 @@ _TIMEOUT_STATUSES = frozenset(
 _AUTHENTICATION_STATUSES = frozenset(
     {"AUTHENTICATION", "PERMISSION_DENIED", "UNAUTHENTICATED"}
 )
+_THINKING_LEVELS = {
+    "minimal": types.ThinkingLevel.MINIMAL,
+    "low": types.ThinkingLevel.LOW,
+    "medium": types.ThinkingLevel.MEDIUM,
+    "high": types.ThinkingLevel.HIGH,
+}
+
+
+def _validated_thinking_level(value: str) -> types.ThinkingLevel:
+    if not isinstance(value, str):
+        raise GeminiConfigurationError(
+            "GEMINI_THINKING_LEVEL must be minimal, low, medium, or high"
+        )
+    resolved = _THINKING_LEVELS.get(value.strip().casefold())
+    if resolved is None:
+        raise GeminiConfigurationError(
+            "GEMINI_THINKING_LEVEL must be minimal, low, medium, or high"
+        )
+    return resolved
+
+
+def _validated_request_timeout_ms(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise GeminiConfigurationError(
+            "GEMINI_REQUEST_TIMEOUT_MS must be a positive integer"
+        )
+    return value
 
 
 def _normalized_api_error_reasons(error: genai_errors.APIError) -> tuple[str, ...]:
@@ -192,6 +219,8 @@ class GeminiModelProvider:
         *,
         api_key: SecretStr | None,
         model: str,
+        thinking_level: str = "minimal",
+        request_timeout_ms: int = 15_000,
         client: _GeminiClient | None = None,
     ) -> None:
         raw_api_key = "" if api_key is None else api_key.get_secret_value().strip()
@@ -204,6 +233,17 @@ class GeminiModelProvider:
             raise GeminiConfigurationError("GEMINI_MODEL must be non-empty")
 
         self._model = model.strip()
+        self._thinking_level = _validated_thinking_level(thinking_level)
+        if (
+            self._model.casefold() == "gemini-3.7-flash"
+            and self._thinking_level == types.ThinkingLevel.MINIMAL
+        ):
+            raise GeminiConfigurationError(
+                "gemini-3.7-flash does not support minimal thinking"
+            )
+        self._request_timeout_ms = _validated_request_timeout_ms(
+            request_timeout_ms
+        )
         self._owns_client = client is None
         resolved_client = client
         if resolved_client is None:
@@ -235,6 +275,8 @@ class GeminiModelProvider:
         return cls(
             api_key=resolved.gemini_api_key,
             model=resolved.gemini_model,
+            thinking_level=resolved.gemini_thinking_level,
+            request_timeout_ms=resolved.gemini_request_timeout_ms,
         )
 
     def close(self) -> None:
@@ -259,8 +301,8 @@ class GeminiModelProvider:
     def _abort_run(self) -> None:
         self._active_run = None
 
-    @staticmethod
     def _request_config(
+        self,
         system_instruction: str,
         tools: tuple[ToolDefinition, ...],
     ) -> types.GenerateContentConfig:
@@ -279,6 +321,12 @@ class GeminiModelProvider:
         )
         return types.GenerateContentConfig(
             system_instruction=system_instruction,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=self._thinking_level,
+            ),
+            http_options=types.HttpOptions(
+                timeout=self._request_timeout_ms,
+            ),
             # The SDK annotation uses an invariant union list even though a
             # plain list of Tool is the documented input.
             tools=gemini_tools,  # type: ignore[arg-type]

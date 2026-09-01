@@ -163,28 +163,14 @@ class AgentReasoningLoopTests(unittest.TestCase):
         )
         self.assertIn("recorded_at", payload["result"])
 
-    def test_yesterday_workout_query_resolves_local_today_before_history(self) -> None:
-        today_call = ModelToolCall(
-            id="today-1",
-            name="get_today_state",
-        )
-        workouts_call = ModelToolCall(
-            id="workouts-1",
-            name="get_workouts_for_day",
-            arguments={"day": "2026-08-30"},
+    def test_yesterday_workout_query_uses_one_postgres_backed_tool_round(self) -> None:
+        yesterday_call = ModelToolCall(
+            id="yesterday-1",
+            name="get_yesterday_state",
         )
         loop, provider = self._loop(
-            ModelTurn(tool_calls=(today_call,)),
-            ModelTurn(tool_calls=(workouts_call,)),
+            ModelTurn(tool_calls=(yesterday_call,)),
             ModelTurn(content="Yesterday you trained barbell bench press."),
-        )
-        today_state = member_state.DayState(
-            self.member_id,
-            date(2026, 8, 31),
-            None,
-            (),
-            member_state.NutritionTotals(0, 0, 0, 0),
-            (),
         )
         workout = WorkoutLog(
             member_id=self.member_id,
@@ -199,51 +185,47 @@ class AgentReasoningLoopTests(unittest.TestCase):
             recorded_at=datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc),
             note=None,
         )
+        yesterday_state = member_state.DayState(
+            self.member_id,
+            date(2026, 8, 30),
+            None,
+            (),
+            member_state.NutritionTotals(0, 0, 0, 0),
+            (workout,),
+        )
 
-        with (
-            patch(
-                "app.agent_tools.member_state.get_today_state",
-                return_value=today_state,
-            ) as get_today,
-            patch(
-                "app.agent_tools.member_state.get_workouts_for_day",
-                return_value=(workout,),
-            ) as get_workouts,
-        ):
+        with patch(
+            "app.agent_tools.member_state.get_yesterday_state",
+            return_value=yesterday_state,
+        ) as get_yesterday:
             response = loop.respond("What did I train yesterday?")
 
         self.assertEqual(
             response,
             "Yesterday you trained barbell bench press.",
         )
-        get_today.assert_called_once_with(
+        get_yesterday.assert_called_once_with(
             self.session,
             self.member_id,
             now=self.event_time,
         )
-        get_workouts.assert_called_once_with(
-            self.session,
-            self.member_id,
-            date(2026, 8, 30),
-        )
         self.session_mock.commit.assert_not_called()
-        self.assertEqual(len(provider.requests), 3)
+        self.assertEqual(len(provider.requests), 2)
 
-        second_request = provider.requests[1][0]
-        assert second_request[-1].content is not None
-        today_payload = json.loads(second_request[-1].content)
-        self.assertEqual(today_payload["result"]["local_date"], "2026-08-31")
-
-        final_request = provider.requests[2][0]
+        final_request = provider.requests[1][0]
         self.assertEqual(
             [message.role for message in final_request],
-            ["system", "user", "assistant", "tool", "assistant", "tool"],
+            ["system", "user", "assistant", "tool"],
         )
-        self.assertEqual(final_request[-1].tool_call_id, "workouts-1")
+        self.assertEqual(final_request[-1].tool_call_id, "yesterday-1")
         assert final_request[-1].content is not None
-        workout_payload = json.loads(final_request[-1].content)
+        yesterday_payload = json.loads(final_request[-1].content)
         self.assertEqual(
-            workout_payload["result"][0]["local_date"],
+            yesterday_payload["result"]["local_date"],
+            "2026-08-30",
+        )
+        self.assertEqual(
+            yesterday_payload["result"]["workout_logs"][0]["local_date"],
             "2026-08-30",
         )
 
@@ -316,6 +298,7 @@ class AgentReasoningLoopTests(unittest.TestCase):
             "get_recent_workouts",
             "get_today_food_totals",
             "get_today_state",
+            "get_yesterday_state",
             "get_workouts_for_day",
             "log_bodyweight",
             "log_food",

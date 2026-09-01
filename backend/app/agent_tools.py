@@ -240,6 +240,19 @@ class BarbarikAgentTools:
             )
         )
 
+    def get_yesterday_state(self) -> DayStateResult:
+        """Return the prior local day's persisted state for the bound member."""
+
+        return self._read(
+            lambda session: _day_state_result(
+                member_state.get_yesterday_state(
+                    session,
+                    self._member_id,
+                    now=self._event_time,
+                )
+            )
+        )
+
     @validate_call
     def get_day_state(self, day: date) -> DayStateResult:
         """Return the bound member's state for one requested local date."""
